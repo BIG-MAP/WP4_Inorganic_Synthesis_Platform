@@ -1,0 +1,2094 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Mon Jun  5 12:10:23 2023
+
+@author: thobson
+This version is desinged to work with an Arduino UNO microcontroller connected over LAN
+Arduino must be loaded with the sketch 'EthernetReceiveSendBinary4_2.ino'
+Microcontroller will send/receive bytes from an RS9000 Orbit Shaker,
+connected via the (female) RS232 port (device address 40).
+Microcontroller will also send/recieve bytes from a second microcontroller (Arduino MKR, devfice address 8)
+to take external thermocouple temperature measurements.
+"""
+
+import requests
+from os import path
+import csv
+import PySimpleGUI as sg
+from time import sleep, time
+from datetime import date
+from datetime import datetime
+import pandas as pd
+
+sg.theme('SystemDefault')
+
+class Heater_Shaker_Controller:
+    
+    def __init__(self,IP_addr="138.253.143.253",devaddr=40,thermaddr=8,valvaddr=4,\
+                 dflt_ramp_file_path="Orbit_Shaker_Default_Ramp_CS.csv",\
+                     dflt_in_path="C:/Data/XPR_Out_Files/"):
+
+#------------------------------Fixed Values------------------------------------
+
+        self.IP_addr = IP_addr  # IP address of the mictrocontroller on LAN network (can be changed in sketch)
+
+        self.devaddr = devaddr # Address of the Orbit Shaker, 40 is the default, but should be shown on startup
+        self.thermaddr = thermaddr # Address of the MKR thermocouple board, can be changed in the control sketch for the MKR, which will also require changing in the sketch for the Uno
+        self.valvaddr = valvaddr # Address of the gas valve, can be changed in sketch on Arduino Uno
+        
+        
+        #------------------------Initialised Parameters--------------------------------
+        
+        self.dflt_ramp_file_path = dflt_ramp_file_path
+        self.dflt_in_path=dflt_in_path
+        print("Default path: "+str(self.dflt_ramp_file_path))
+        
+        self.dflt_ramp = 2.0     # Default slow ramp rate in RPM per min
+        
+        cs_str = '-1'
+        dr_str = '-1'
+        
+        self.proc_status = "Manual"
+        self.error_str = 'No errors'
+        self.timer_started = False
+        self.timer_stopped = False
+        self.al_sounded = False
+        
+        self.stirr_on = False
+        self.heat_on = False
+        self.sound_sh_on = False
+        self.sound_m_on = False
+        self.sound_l_on = False
+        
+        self.valvopen = False
+        
+        self.on_off = 0  # Initially set to 0 as byte defined by adding
+        
+        self.first_heat = False
+        self.first_stirr = False
+        self.first_both = True
+        
+        self.logs_on = True
+        self.logs_started = False
+        self.segs = 1
+        self.log_step_size = 30.0    # The time period (in s) over which process parameters are logged
+        
+        self.t_set = 0    # Temperature setpoint in degrees C
+        self.t_ramp_set = 0     # Temperature ramp rate in deg C per min
+        
+        
+        self.a_speed_set = 0       # Agitation speed in RPM
+        self.a_ramp_set = 0      # Agitation speed ramp in minutes to setpoint
+        self.steps_to_speed_1 = 1
+        
+        self.dwell_time = 0
+        self.ramp_time = 0
+        self.ramp_1_0_time = 0
+        self.step_num = 0
+        
+        self.steps_s = []
+        self.steps_r = []
+        
+        #--------------------------Limiting Parameters-------------------------------
+        
+        self.t_set_max = 150
+        self.t_ramp_max = 9
+        self.a_speed_max = 600 
+        self.a_ramp_max = 5.0      # Max agitation speed to be set durectly, larger values require stepping
+        
+        #-------------------------------Tolerances------------------------------------
+        
+        self.max_wait = 3.0 # Time (in s) application will wait for response when reading/writing values before timing out
+        self.agit_tol = 1.0 # Value below setpoint (in RPM) at which timer will start
+        self.temp_tol = 1.0 # Value below setpoint (in C) at which timer will start
+        
+        #--------------------------RAM Addresses---------------------------------------
+        
+        # All addresses can be used for read or write operations, if used in Comm_Read and Comm_Write respectively
+        
+        self.ram_HS_OnOff = 33
+        
+        self.ram_errors = 34
+        
+        self.ram_temp_high = 36  # RAM address for temperature setpoint
+        self.ram_temp_low = 37
+        self.ram_temp_ramp = 38  # RAM address for temperature ramp
+        
+        self.ram_agit_high = 41  # RAM address for speed setpoint
+        self.ram_agit_low = 42
+        self.ram_agit_ramp = 43  # RAM address for speed ramp
+        
+        self.ram_temp_meas_read_high = 39    # RAM address for temperature measurement (internal)
+        self.ram_temp_meas_read_low = 40
+        
+        self.ram_temp_meas_ext_read_high = 1    # RAM address for temperature measurement from the thermocouple
+        self.ram_temp_meas_ext_read_low = 0
+        
+        self.ram_agit_meas_read_high = 44    # # RAM address for speed measurement
+        self.ram_agit_meas_read_low = 45
+        
+        self.ram_heat_pow = 48
+
+
+
+
+#------------------------Heater, Stirrer & Sounder On/Off----------------------
+
+    def OnOff_Bin(self,stirrer_on, heater_on, sound_short_on, sound_med_on, sound_long_on):
+    
+        on_off_byte = 0
+        
+        if (stirrer_on == True):
+            on_off_byte += 2
+        if (heater_on == True):
+            on_off_byte += 4
+        if (sound_short_on == True):
+            on_off_byte += 64
+        if (sound_med_on == True):
+            on_off_byte += 128  
+        if (sound_long_on == True):
+            on_off_byte += 192
+        
+        return(on_off_byte)
+    
+    def OnOff_Bin_Read(self,on_off_bin):
+    
+        if ((on_off_bin % 8) == 0):
+            heat_on = 'Off'
+            stirr_on = 'Off'
+        if ((on_off_bin % 8) == 2):
+            heat_on = 'Off'
+            stirr_on = 'On'
+        if ((on_off_bin % 8) == 4):
+            heat_on = 'On'
+            stirr_on = 'Off'
+        if ((on_off_bin % 8) == 6):
+            heat_on = 'On'
+            stirr_on = 'On'
+    
+        return heat_on, stirr_on
+
+#-------------------------Error Interpretation Function----------------------------
+
+    def Err_Bin_Read(self,err_bin):
+    
+        if (err_bin == 0):
+            err_string = 'No Errors'
+        else:
+            err_string = ''
+            if ((err_bin % 16) == 8):
+                err_string = err_string + 'Excessive RPM; '
+            if ((err_bin % 32) >= 16):
+                err_string = err_string + 'Internal temp probe shorted; '
+            if ((err_bin % 64) >= 32):
+                err_string = err_string + 'Internal temp probe disconnected; '
+            if ((err_bin % 128) >= 64):
+                err_string = err_string + 'External temp probe error; '
+            if (err_bin >= 128):
+                err_string = err_string + 'Motor high current error; '
+    
+        return err_string
+
+#-------------------------Temp Setpoint and Ramp Write----------------------------
+
+    def Temp_Set_Bin(self,temp_set):       # Translates the user input temperature values into binary values needed to send commands
+    
+        temp_set_hex = hex(int(temp_set*10))
+        print (temp_set_hex)
+        if (len(temp_set_hex) > 3):
+            temp_set_hex_low = "0x"+temp_set_hex[-2:]
+        else:
+            temp_set_hex_low = "0x"+temp_set_hex[-1:]
+        print(temp_set_hex_low)
+        
+        if (len(temp_set_hex) == 6):
+            temp_set_hex_high = "0x"+temp_set_hex[-4:-2]
+        if (len(temp_set_hex) == 5):
+            temp_set_hex_high = "0x"+temp_set_hex[-3:-2]
+        if (len(temp_set_hex) <= 4):
+            temp_set_hex_high = "0x0"
+            
+        # print(temp_set_hex_high)
+        
+        temp_set_dec_low = int(temp_set_hex_low, 16)
+        temp_set_dec_high = int(temp_set_hex_high, 16)
+        
+        print(temp_set_dec_high)
+        print(temp_set_dec_low)
+    
+        return(temp_set_dec_high, temp_set_dec_low)
+    
+    def Temp_Set_Ramp_Bin(self,temp_ramp_set):   # Translates the user input temp ramp value into binary to send as command
+        
+        temp_ramp_set_dec = int(temp_ramp_set*10) # values are multiplied by 10 before being read by heater shaker
+        print(temp_ramp_set_dec)
+        
+        return(temp_ramp_set_dec)
+
+
+#-------------------------Temp Setpoint, Meas and Ramp Read-----------------------
+
+    def Temp_Bin_Read(self,temp_bin_high, temp_bin_low):       # Translates binary values read from machine into temperature values to be displayed (reverse of 'Temp_Set_Bin')
+    
+        temp_high_hex = hex(temp_bin_high)
+        temp_low_hex = hex(temp_bin_low)
+    
+    ##    print('Temp high hex: '+temp_high_hex)
+        
+        if (temp_bin_high == 0):
+            temp_hex = temp_low_hex
+        elif(len(temp_low_hex)<4):
+            temp_hex = "0x"+temp_high_hex[-((len(temp_high_hex)-2)):]+"0"+temp_low_hex[-((len(temp_low_hex)-2)):] # Necessary to prevent eg. 0x104 reading as 0x14
+        else:
+            temp_hex = "0x"+temp_high_hex[-((len(temp_high_hex)-2)):]+temp_low_hex[-((len(temp_low_hex)-2)):]       # Strips the 2 characters '0x' from the high and low hexadecimal strings and concatenates them
+    
+    ##    print('Temp hex high: '+temp_high_hex[-((len(temp_high_hex)-2)):])
+    ##    print('Temp hex low: '+temp_low_hex[-((len(temp_low_hex)-2)):])
+    ##    print('Temp hex: '+temp_hex)
+        
+        temp_meas_dec = int(temp_hex, 16)
+        temp_result = float(temp_meas_dec)/10                                                                              
+    
+        return(temp_result)
+    
+    def Temp_Ramp_Bin_Read(self,temp_ramp_set_dec):   # Translates the user input temp ramp value into binary to send as command
+        
+        temp_ramp_set=float(temp_ramp_set_dec)/10
+        print(temp_ramp_set)
+        
+        return(temp_ramp_set)
+
+
+#-------------------------Speed Setpoint and Ramp------------------------------
+
+    def Agit_Set_Bin(self,agit_speed_set):     # Translates the user input speed values into binary values needed to send commands
+    
+        agit_speed_hex = hex(int(agit_speed_set))
+        print ('Speed Hex: '+str(agit_speed_hex))
+        if (len(agit_speed_hex) > 3):
+            agit_speed_hex_low = "0x"+agit_speed_hex[-2:]
+        else:
+            agit_speed_hex_low = "0x"+agit_speed_hex[-1:]
+        print("Speed Hex Low: "+str(agit_speed_hex_low))
+        
+        if (len(agit_speed_hex)== 6):
+            agit_speed_hex_high = "0x"+agit_speed_hex[-4:-2]
+        if (len(agit_speed_hex) == 5):
+            agit_speed_hex_high = "0x"+agit_speed_hex[-3:-2]
+        if (len(agit_speed_hex) <= 4):
+            agit_speed_hex_high = "0x0"
+            
+        print("Speed Hex High: "+str(agit_speed_hex_high))
+        
+        agit_speed_dec_low = int(agit_speed_hex_low, 16)
+        agit_speed_dec_high = int(agit_speed_hex_high, 16)
+    
+        print("Speed Dec Low: "+str(agit_speed_dec_low))
+        print("Speed Dec High: "+str(agit_speed_dec_high))
+    
+        return(agit_speed_dec_high,agit_speed_dec_low)
+    
+    def Agit_Set_Ramp_Bin(self,agit_ramp_set):   # Translates the user input speed ramp value into binary to send as command
+        
+        agit_ramp_set_dec = int(agit_ramp_set*10)
+        
+        return(agit_ramp_set_dec)
+
+#---------------------Agit Setpoint, Meas and Ramp Read-------------------------
+
+    def Agit_Bin_Read(self,agit_bin_high, agit_bin_low):     # Translates binary values read from machine into speed values to be displayed (reverse of 'Agit_Set_Bin')
+    
+        agit_high_hex = hex(agit_bin_high)
+        agit_low_hex = hex(agit_bin_low)
+    
+    
+        if (agit_bin_high == 0):
+            agit_hex = agit_low_hex
+        elif (len(agit_low_hex)<4):
+            agit_hex = "0x"+agit_high_hex[-((len(agit_high_hex)-2)):]+"0"+agit_low_hex[-((len(agit_low_hex)-2)):]   # Necessary to prevent eg. 0x104 reading as 0x14
+        else:
+            agit_hex = "0x"+agit_high_hex[-((len(agit_high_hex)-2)):]+agit_low_hex[-((len(agit_low_hex)-2)):]
+    
+        
+        agit_meas_dec = int(agit_hex, 16)
+        agit_result = float(agit_meas_dec)      # These values not being divided by 10 is the only actual difference to the function 'Temp_Bin_Read'                                                                              
+    
+        return(agit_result)
+    
+    def Agit_Ramp_Bin_Read(self,agit_ramp_set_dec):   # Translates the user input speed ramp value into binary to send as command
+        
+        agit_ramp_set=float(agit_ramp_set_dec)/10
+        
+        return(agit_ramp_set)
+    
+    def Heat_Pow_Bin_Read(self,heat_bin):
+    
+        per = round(((float(heat_bin)/255)*100),0)
+    
+        return per
+
+
+#-----------------------Send/Receive Functions----------------------------------
+
+    def Comm_Write(self,dvaddr, ramaddr, datbyte): # Function to write commands to RS9000 and confirm
+    
+        payload = {'dv': str(dvaddr), 'rv':str(ramaddr), 'dtv':str(datbyte)} # Define the values to send to the microcontroller            
+        r2 = requests.post('http://'+self.IP_addr+'/post', params = payload) # This is the line that sends the command values over the network
+    
+        HTML_string = r2.text # Makes a string of the HTML code in the request
+        
+        sub_ind1 = HTML_string.index("""id="cs""") # Finds where checksum (cs) is first defined in HTML
+        cs_sub_string = HTML_string[sub_ind1:HTML_string.index("><br>", sub_ind1)] # Takes out the substring where the cs value is defined
+        # print(cs_sub_string) # Uncomment for debugging
+        cs_str = cs_sub_string[-(len(cs_sub_string)-24):] # Substring will contain 24 characters then the value, these last characters are the cs value
+        
+    
+        sub_ind2 = HTML_string.index("""id="dr""") # Finds where data read (dr) is first defined in HTML
+        dr_sub_string = HTML_string[sub_ind2:HTML_string.index("><br>", sub_ind2)] # Takes out the substring where the dr value is defined
+        # print(dr_sub_string) # Uncomment for debugging
+        dr_str = dr_sub_string[-(len(dr_sub_string)-24):] # Substring will contain 24 characters then the value, these last characters are the dr value
+        
+    
+        return (cs_str, dr_str)
+
+    def Comm_Read(self,dvaddr, ramaddr): # Function to read values from RS9000 and confirm
+    
+        payload = {'dv': str(dvaddr), 'rv':str(ramaddr+128)} # 128 is always added to RAM addresses for reading, as machine interprets highest bit of '1' as read operation           
+        r2 = requests.post('http://'+self.IP_addr+'/post', params = payload) # This is the line that sends the command values over the network
+    
+        HTML_string = r2.text # Makes a string of the HTML code in the request
+        
+        sub_ind1 = HTML_string.index("""id="cs""") # Finds where checksum (cs) is first defined in HTML
+        cs_sub_string = HTML_string[sub_ind1:HTML_string.index("><br>", sub_ind1)] # Takes out the substring where the cs value is defined
+        # print("cs_substring: "+cs_sub_string) # Uncomment for debugging
+        cs_str = cs_sub_string[-(len(cs_sub_string)-24):] # Substring will contain 24 characters then the value, these last characters are the cs value
+        
+    
+        sub_ind2 = HTML_string.index("""id="dr""") # Finds where data read (dr) is first defined in HTML
+        dr_sub_string = HTML_string[sub_ind2:HTML_string.index("><br>", sub_ind2)] # Takes out the substring where the dr value is defined
+        # print("dr_substring: "+dr_sub_string) # Uncomment for debugging
+        dr_str = dr_sub_string[-(len(dr_sub_string)-24):] # Substring will contain 24 characters then the value, these last characters are the dr value
+        
+    
+        return (cs_str, dr_str)
+
+    
+
+#----------------------------Simple Byte Reading Functions -----------------------
+
+    def One_Byte_Read(self,dvaddr,ram_addr): # Simple function to read the data byte of a given address
+                chks_str = '-1'
+                datr_str = '-1'
+    
+                # print("Device address: "+str(dvaddr))
+                # print("RAM address: "+str(ram_addr))
+            
+                chks_str, datr_str = self.Comm_Read(dvaddr, ram_addr)  # Reads the current speed to take as starting point for ramping
+                byte_read = int(datr_str)
+                # print("Single byte: "+str(byte_read))
+                
+                return(byte_read)
+
+
+    def Two_Byte_Read(self,dvaddr,ram_high,ram_low): # Same as above, but for reading the high and low bytes of a parameter
+                chks_str = '-1'
+                datr_str = '-1'
+    
+                # print("Device address: "+str(dvaddr))
+                # print("RAM address high: "+str(ram_high))
+                # print("RAM address low: "+str(ram_low))
+                
+            
+                chks_str, datr_str = self.Comm_Read(dvaddr, ram_high)  # Reads the current speed to take as starting point for ramping
+                byte_high = int(datr_str)
+                # print("High byte: "+str(byte_high))
+            
+                chks_str, datr_str = self.Comm_Read(dvaddr, ram_low)
+                byte_low = int(datr_str)
+                # print("Low byte: "+str(byte_low))
+                
+                return(byte_high,byte_low)
+
+
+
+
+#-------------------Full Setting Functions Including Checks---------------------
+
+    def Set_On_Off(self,str_on, ht_on, snd_sh_on, snd_m_on, snd_l_on, daddr, rm_HS_OnOff, mx_wait):
+    
+            on_off = self.OnOff_Bin(str_on, ht_on, snd_sh_on, snd_m_on, snd_l_on)
+            # print (on_off)
+    
+            cs_str = '-1'
+    
+            t_0 = time()        # Starts a counter for timeout if the command is not received
+            
+            while (cs_str == '-1'):
+    
+                print('Writing On/Off command')
+    
+                cs_str, dr_str = self.Comm_Write(daddr, rm_HS_OnOff, on_off) # Write commands to RS9000 and confirm
+    
+                print('On/Off write Checksum = '+cs_str)
+               # print('Data byte = '+dr_str)
+    
+                if ((time() - t_0) > mx_wait):     # Loop will time out if no response after 5 seconds
+    
+                   print('No response received, timed out. Check RS9000 is connected')
+    
+                   break
+    
+            cs_str = '-1'
+    
+            t_0 = time()        # Starts a counter for timeout if the command is not received
+            
+            while (cs_str == '-1'):
+                
+                print('Reading On/Off command')
+                
+                cs_str, dr_str = self.Comm_Read(daddr, rm_HS_OnOff) # Read values from RS9000 and confirm
+    
+                print('On/Off read Checksum = '+cs_str)
+                print('On/Off read Data byte = '+dr_str)
+    
+                if ((time() - t_0) > mx_wait):     # Loop will time out if no response after 5 seconds
+    
+                   print('No response received, timed out. Check RS9000 is connected')
+    
+                   break
+    
+    ##        if (int(dr_str) == on_off):        
+    ##            print("On/Off settings confirmed")
+
+    def Temp_Set(self,t_set, max_wait):
+    
+            print("Running temp set.")
+    
+            temp_set_bytes = self.Temp_Set_Bin(t_set) # Function returns array with two values, the high and low bytes
+            temp_set_byte_high = temp_set_bytes[0]
+            temp_set_byte_low = temp_set_bytes[1]
+    ##        print ('Temp set byte high: '+str(temp_set_byte_high)) # For debugging
+    ##        print ('Temp set byte low: '+str(temp_set_byte_low))
+    
+            dr_str = '-1'
+            
+            while (int(dr_str) != temp_set_byte_high):      # This loop will run until the setting as read from the machine matches the intended setting
+            
+                cs_str = '-1'
+    
+                t_0 = time()        # Starts a counter for timeout if the command is not received
+                
+                while (cs_str == '-1'):     # This loop runs until it is confirmed that the command was received (i.e. positive 'checksum' value)
+    
+                    print('Attempting to write temp high')
+                    cs_str, dr_str = self.Comm_Write(self.devaddr, self.ram_temp_high, temp_set_byte_high) # Function to write commands to RS9000 and confirm
+                    print('Checksum = '+cs_str)
+                    print('Data byte = '+dr_str)
+    
+                    if ((time() - t_0) > max_wait):     # Loop will time out if no response after 5 seconds
+    
+                        print('No response received, timed out. Check RS9000 is connected')
+    
+                        break            
+    
+                cs_str = '-1'
+    
+                t_0 = time()        # Starts a counter for timeout if the command is not received
+                
+                while (cs_str == '-1'):
+                    
+                    print('Attempting to read temp high')
+                    cs_str, dr_str = self.Comm_Read(self.devaddr, self.ram_temp_high) # Function to read commands to RS9000 and confirm
+                    print('Checksum = '+cs_str)
+                    print('Data byte = '+dr_str)
+    
+                    if ((time() - t_0) > max_wait):     # Loop will time out if no response after 5 seconds
+    
+                        print('No response received, timed out. Check RS9000 is connected')
+    
+                        break
+                if ((time() - t_0) > max_wait):     # If the write attempt timed out, the loop is also broken
+    
+                    break            
+    
+            if (int(dr_str) == temp_set_byte_high):
+                print('Temp set high confirmed')
+    
+            dr_str = '-1'
+            
+            while (int(dr_str) != temp_set_byte_low):
+    
+                cs_str = '-1'
+    
+                t_0 = time()        # Starts a counter for timeout if the command is not received
+                
+                while (cs_str == '-1'):
+                    
+                    print('Attempting to write temp low')
+                    cs_str, dr_str = self.Comm_Write(self.devaddr, self.ram_temp_low, temp_set_byte_low) # Repeat for temp byte low
+                    print('Checksum = '+cs_str)
+                    print('Data byte = '+dr_str)
+    
+                    if ((time() - t_0) > max_wait):     # Loop will time out if no response after 5 seconds
+    
+                        print('No response received, timed out. Check RS9000 is connected')
+    
+                        break
+    
+                cs_str = '-1'
+    
+                t_0 = time()        # Starts a counter for timeout if the command is not received
+                
+                while (cs_str == '-1'):
+                    
+                    print('Attempting to read temp low')
+                    cs_str, dr_str = self.Comm_Read(self.devaddr, self.ram_temp_low) # Repeat for temp byte low
+                    print('Checksum = '+cs_str)
+                    print('Data byte = '+dr_str)
+    
+                    if ((time() - t_0) > max_wait):     # Loop will time out if no response after 5 seconds
+    
+                        print('No response received, timed out. Check RS9000 is connected')
+    
+                        break
+    
+                if ((time() - t_0) > max_wait):     # If the write attempt timed out, the loop is also broken
+    
+                    break
+                    
+    
+            if (int(dr_str) == temp_set_byte_low):        
+                print('Temp set low confirmed')
+
+    def Temp_Ramp_Set(self,t_ramp_set, max_wait):
+            print("Ramp setting function")
+            temp_ramp_set_byte = self.Temp_Set_Ramp_Bin(t_ramp_set)
+    
+            dr_str = '-1'
+            
+            while (int(dr_str) != temp_ramp_set_byte):
+                        
+                cs_str = '-1'
+                
+                t_0 = time()        # Starts a counter for timeout if the command is not received
+                
+                while (cs_str == '-1'):
+    
+                    print('Attempting to write temp ramp')
+    
+    
+                    cs_str, dr_str = self.Comm_Write(self.devaddr, self.ram_temp_ramp, temp_ramp_set_byte) # Write commands to RS9000 and confirm
+                    print('Checksum = '+cs_str)
+                    print('Data byte = '+dr_str)
+    
+                    if ((time() - t_0) > max_wait):     # If the write attempt timed out, the loop is also broken
+                        print('No response received, timed out. Check RS9000 is connected')
+                        break
+    
+                cs_str = '-1'
+    
+                t_0 = time()        # Starts a counter for timeout if the command is not received
+                
+                while (cs_str == '-1'):
+    
+                    print('Attempting to read temp ramp')
+    
+                    cs_str, dr_str = self.Comm_Read(self.devaddr, self.ram_temp_ramp)
+                    print('Checksum = '+cs_str)
+                    print('Data byte = '+dr_str)
+    
+                    if ((time() - t_0) > max_wait):     # If the write attempt timed out, the loop is also broken
+                        print('No response received, timed out. Check RS9000 is connected')
+                        break
+                if ((time() - t_0) > max_wait):     # If the write attempt timed out, the loop is also broken
+                    
+                    break
+    
+                if (int(dr_str) == temp_ramp_set_byte):
+                    print('Temp ramp set confirmed')
+
+    def Speed_Set(self,a_speed_set, max_wait):
+    
+            print('Speed setting: '+str(a_speed_set)+' RPM')
+            
+            agit_speed_set_bytes = self.Agit_Set_Bin(a_speed_set)
+            agit_speed_set_byte_high = agit_speed_set_bytes[0]
+            agit_speed_set_byte_low = agit_speed_set_bytes[1]
+    
+            dr_str = '-1'
+            
+            while (int(dr_str) != agit_speed_set_byte_high):
+    
+                cs_str = '-1'
+                t_0 = time()        # Starts a counter for timeout if the command is not received
+                    
+                while (cs_str == '-1'):
+                        
+                    print('Writing agit high')
+    
+                    cs_str, dr_str = self.Comm_Write(self.devaddr, self.ram_agit_high, agit_speed_set_byte_high) # Function to write commands to RS9000 and confirm
+                    print('Agit high write Checksum = '+cs_str)
+                    print('Agit high write Data byte = '+dr_str)
+    
+                    if ((time() - t_0) > max_wait):     # If the write attempt timed out, the loop is also broken
+                        print('No response received, timed out. Check RS9000 is connected')
+                        break
+    
+                cs_str = '-1'
+                t_0 = time()        # Starts a counter for timeout if the command is not received
+                    
+                while (cs_str == '-1'):
+                        
+                    print('Reading agit high')
+    
+                    cs_str, dr_str = self.Comm_Read(self.devaddr, self.ram_agit_high) # Function to read commands to RS9000 and confirm
+                    print('Agit high read Checksum = '+cs_str)
+                    print('Agit high read Data byte = '+dr_str)
+    
+                    if ((time() - t_0) > max_wait):     # If the write attempt timed out, the loop is also broken
+                        print('No response received, timed out. Check RS9000 is connected')
+                        break
+    
+                if ((time() - t_0) > max_wait):     # If the write attempt timed out, the loop is also broken
+                    
+                    break
+    
+            if (int(dr_str) == agit_speed_set_byte_high):        
+                print('Speed set high confirmed at '+str(agit_speed_set_byte_high))
+    
+            dr_str = '-1'
+            
+            while (int(dr_str) != agit_speed_set_byte_low):
+                
+    
+                cs_str = '-1'
+                t_0 = time()        # Starts a counter for timeout if the command is not received
+                    
+                while (cs_str == '-1'):
+    
+                    print('Writing agit low')
+    
+                    cs_str, dr_str = self.Comm_Write(self.devaddr, self.ram_agit_low, agit_speed_set_byte_low) # Repeat for speed byte low
+                    print('Agit low write Checksum = '+cs_str)
+                    print('Agit low write Data byte = '+dr_str)
+    
+                    if ((time() - t_0) > max_wait):     # If the write attempt timed out, the loop is also broken
+                        print('No response received, timed out. Check RS9000 is connected')
+                        break
+    
+                cs_str = '-1'
+                t_0 = time()        # Starts a counter for timeout if the command is not received
+                    
+                while (cs_str == '-1'):
+    
+                    print('Reading agit low')
+    
+                    cs_str, dr_str = self.Comm_Read(self.devaddr, self.ram_agit_low) # Repeat for temp byte low
+                    print('Agit low read Checksum = '+cs_str)
+                    print('Agit low read Data byte = '+dr_str)
+    
+                    if ((time() - t_0) > max_wait):     # If the write attempt timed out, the loop is also broken
+                        print('No response received, timed out. Check RS9000 is connected')
+                        break
+    
+                if ((time() - t_0) > max_wait):     # If the write attempt timed out, the loop is also broken
+                    
+                    break
+    
+            if (int(dr_str) == agit_speed_set_byte_low):        
+                print('Speed set low confirmed at '+str(agit_speed_set_byte_low))
+
+    def Set_Speed_Ramp(self,a_ramp_set, max_wait):
+    
+            agit_ramp_set_byte = self.Agit_Set_Ramp_Bin(a_ramp_set)
+    
+            dr_str = '-1'
+            
+            while (int(dr_str) != agit_ramp_set_byte):
+    
+                cs_str = '-1'
+                t_0 = time()        # Starts a counter for timeout if the command is not received
+                    
+                while (cs_str == '-1'):
+    
+    
+                    cs_str, dr_str = self.Comm_Write(self.devaddr, self.ram_agit_ramp, agit_ramp_set_byte) # Function to write commands to RS9000 and confirm
+                    print('Agit ramp write Checksum = '+cs_str)
+                    print('Agit ramp write Data byte = '+dr_str)
+    
+                    if ((time() - t_0) > max_wait):     # If the write attempt timed out, the loop is also broken
+                        print('No response received, timed out. Check RS9000 is connected')
+                        break
+                    
+                cs_str = '-1'
+                t_0 = time()        # Starts a counter for timeout if the command is not received
+                
+    
+                while (cs_str == '-1'):    
+    
+                    cs_str, dr_str = self.Comm_Read(self.devaddr, self.ram_agit_ramp) # Read values to check
+                    print('Agit ramp read Checksum = '+cs_str)
+                    print('Agit ramp read Data byte = '+dr_str)
+    
+                    if ((time() - t_0) > max_wait):     # If the write attempt timed out, the loop is also broken
+                        print('No response received, timed out. Check RS9000 is connected')
+                        break
+    
+                if ((time() - t_0) > max_wait):     # If the write attempt timed out, the loop is also broken
+    
+                    break
+    
+            if (int(dr_str) == agit_ramp_set_byte):        
+                print('Speed ramp set confirmed at '+str(agit_ramp_set_byte))
+
+    def Set_Gas_Valve(self,valve_on,ram_r_wr):   # Function to send a command to open valve (really just a pin output high on the relay connnection)
+        
+        cs_str = '-1'
+        dr_str = '-1'
+        valve_is_on = "Off"
+        
+        if (valve_on == True):
+            valve_set = 1
+    
+        if (valve_on == False):
+            valve_set = 0
+    
+        if (ram_r_wr == 1): # To confirm it is a write command
+            try:
+                self.Comm_Write(self.valvaddr,ram_r_wr,valve_set)
+                if (valve_on == True):
+                    valve_is_on = "On"
+                if (valve_on == False):
+                    valve_is_on = "Off"
+            except:
+                print("Could not send command to valve")
+    
+        else:
+            print("Valve or RAM address incorrect, treating valve as off, but status unknown")  # Stand-in message as I have currently been unable to get the read function to work
+            
+    
+        return(valve_is_on)
+
+    def Read_Gas_Valve(self,ram_r_wr):   # Function 
+        cs_str = '-1'
+        dr_str = '-1'
+        valve_is_on = "Unkn"
+    
+        if (ram_r_wr == 0):
+            try:
+                cs_str, dr_str = self.Comm_Read(self.valvaddr,ram_r_wr)
+                if (dr_str == '1'):
+                    valve_is_on = "On"
+                if (dr_str == '0'):
+                    valve_is_on = "Off"
+            except:
+                print("Could not send command to valve")
+    
+        else:
+            print("Valve or RAM address incorrect")
+    
+        return(valve_is_on)
+
+#-------------------Function to Generate List of Speed Setpoints and Ramps-------------
+
+            
+    def Get_Ramp_List(self,steps_s,steps_r,a_speed_0,a_speed_set,a_ramp_set,dwell_time_sp,st_num=1):
+        if (a_speed_set <= self.a_speed_max):
+        
+            if (a_ramp_set <= self.a_ramp_max):
+                steps_s.append(a_speed_set)
+                steps_r.append(a_ramp_set)
+            else:           # Allows for ramp times longer than the maximum allowed by the system (9 mins) by breaking ramp down into multiple steps
+                seg_num = (a_ramp_set/self.a_ramp_max)
+                print('segnum: '+str(seg_num))
+                speed_step = ((a_speed_set-a_speed_0)/seg_num)
+                print('Speed step: '+str(speed_step))
+                seg_rem = seg_num - float(int(seg_num))
+                print('segrem: '+str(seg_rem))
+                if (seg_rem == 0):      # if the interval is a multiple of the max ramp, no fractional step is used
+                    segs = int(seg_num)
+                    for i in range(1,(segs+1)):     # Makes a list of the temperature setpoint steps and the ramps to be used for each (all max ramp bar the last step)
+                        print('Step: '+str(round(((speed_step*float(i))+a_speed_0),0)))
+                        steps_s.append(round(((speed_step*float(i))+a_speed_0),0))
+                        steps_r.append(self.a_ramp_max)
+                else:       # If the interval is not a multiple of the max ramp, and additional, fractional step is included at the end
+                    segs = int(seg_num)+1
+                    for i in range(1,segs):     # Makes a list of the temperature setpoint steps and the ramps to be used for each (all max ramp bar the last step)
+                        print('Step: '+str(round(((speed_step*float(i))+a_speed_0),0)))
+                        steps_s.append(round(((speed_step*float(i))+a_speed_0),0))
+                        steps_r.append(self.a_ramp_max)
+                    steps_s.append(a_speed_set)
+                    steps_r.append(round((self.a_ramp_max*seg_rem),0))   # These manage the last step of the ramp which will usually be some fraction of max ramp
+            
+            steps_r[-1] = steps_r[-1] + round(dwell_time_sp,0)    # If a dwell time at sp1 is specified, this is added to the last ramp time in the current list (not a new list element)    
+        
+            step_num = st_num
+        
+        else:
+            step_num = 0
+        
+        return steps_s, steps_r, step_num
+    
+#---------------------------Log Saving Function--------------------------------
+
+
+    def Save_Logs(self,l_dict,l_headings,time_list,temp_sp_list,temp_rmp_list,temp_m_list,temp_m_ext_list,speed_sp_list,\
+                  speed_sp_1_list,speed_sp_2_list,speed_rmp_list,speed_m_list,\
+                  heat_pow_list,stirr_stat_list,err_stat_list,proc_stat_list):
+        
+                l_dict[l_headings[0]] = time_list
+                l_dict[l_headings[1]] = temp_sp_list
+                l_dict[l_headings[2]] = temp_rmp_list
+                l_dict[l_headings[3]] = temp_m_list
+                l_dict[l_headings[4]] = temp_m_ext_list
+                l_dict[l_headings[5]] = speed_sp_list
+                l_dict[l_headings[6]] = speed_sp_1_list
+                l_dict[l_headings[7]] = speed_sp_2_list
+                l_dict[l_headings[8]] = speed_rmp_list
+                l_dict[l_headings[9]] = speed_m_list
+                l_dict[l_headings[10]] = heat_pow_list
+                l_dict[l_headings[11]] = stirr_stat_list
+                l_dict[l_headings[12]] = err_stat_list
+                l_dict[l_headings[13]] = proc_stat_list
+    
+                df_log = pd.DataFrame(l_dict,columns=l_headings)
+    
+                log_file_path = 'C:/Data/RS9000_Out_Files/'
+                log_file_name = 'Logs_'+str(date.today())+'_'+str(datetime.now().strftime('%H%M%S')+'.csv')
+    
+                log_file = df_log.to_csv((log_file_path+log_file_name),index=False,sep=',',columns=l_headings)
+    
+                print('Logs saved at: '+log_file_path+log_file_name)
+                sg.popup('Logs saved at: '+log_file_path+log_file_name)
+
+#----------------------------Dialog Box Functions------------------------------
+
+    def Manual_Control_Dialog(self):
+    
+        line0 = sg.Text("Manual On/Off Options",font=('Arial Bold',16))
+        
+        l01 = sg.Button("Stirrer Off",key='-STIRROFF-', button_color=('navy', 'white'))
+        l02 = sg.Button("Heater Off", key='-HEATOFF-', button_color=('navy', 'white'))
+        l03 = sg.Button("Sounder Off", key = '-SOUNDOFF-', button_color=('navy', 'white'))
+        
+        b01 = sg.Button("Stirrer On", key='-STIRRON-', button_color='navy')
+        b02 = sg.Button("Heater On", key='-HEATON-', button_color='navy')
+        b011 = sg.Button("Sounder Short", key='-SOUNDSHRT-', button_color='navy')
+        b012 = sg.Button("Sounder Medium", key = '-SOUNDMED-', button_color='navy')
+        b013 = sg.Button("Sounder Long", key='-SOUNDLONG-', button_color='navy')
+        b014 = sg.Button("Valve Closed", key='-VALVCLSD-', button_color=('navy','white'))
+        b015 = sg.Button("Valve Open", key='-VALVOPEN-', button_color='navy')
+        
+        line10 = sg.Text('Manual Process Parameters',font=('Arial Bold',16))
+        
+        line1 = sg.Text("Enter temperature setpoint in C, (0.1 C precision)", key='-OUT-',expand_x=True, justification='left')
+        box1 = sg.Input('', enable_events=True,key='-INPUT1-', expand_x=True, justification='left')
+        
+        line2 = sg.Text("Enter temperature ramp in C per min, (0.1 C precision)", key='-OUT-',expand_x=True, justification='left')
+        box2 = sg.Input('', enable_events=True,key='-INPUT2-', expand_x=True, justification='left')
+        
+        line3 = sg.Text("Enter speed setpoint in RPM, (1 RPM precision)", key='-OUT-',expand_x=True, justification='left')
+        box3 = sg.Input('', enable_events=True,key='-INPUT3-', expand_x=True, justification='left')
+        
+        line4 = sg.Text("Enter speed ramp in minues to setpoint, (0.1 minute precision)", key='-OUT-',expand_x=True, justification='left')
+        box4 = sg.Input('', enable_events=True,key='-INPUT4-', expand_x=True, justification='left')
+        
+        send_a_1 = sg.Button("Send On/Off", key='-SENDONOFF-', button_color='navy')
+        send_b_1 = sg.Button("Send Temp Set", key='-SENDTS-', button_color='navy')
+        send_b_2 = sg.Button("Send Temp Ramp", key='-SENDTR-', button_color='navy')
+        send_b_3 = sg.Button("Send Stirr Set", key='-SENDSS-', button_color='navy')
+        send_b_4 = sg.Button("Send Stirr Ramp", key='-SENDSR-', button_color='navy')
+        send_c_1 = sg.Button("Send Valve Set", key='-SENDVALV-', button_color='navy')
+        
+        back_b = sg.Button("Back", key='-BACK-',button_color='navy')
+        end_b = sg.Button("Finish", key='-FINISH-', button_color='navy')
+        
+        layout_1 = [[line0],\
+                  [l01,b01],[l02,b02],[l03,b011,b012,b013],\
+                  [send_a_1],\
+                  [b014,b015,send_c_1],
+                  [],\
+                  [line10],\
+                  [line1],[box1,send_b_1],\
+                  [line2],[box2,send_b_2],\
+                  [line3],[box3,send_b_3],\
+                  [line4],[box4,send_b_4],\
+                  [back_b,end_b]]
+            
+        window_1 = sg.Window("Orbit Shaker Manual Control", layout_1, size=(750,600))
+        
+        while True:
+            event, values = window_1.read() # 'window1' was defined in the dialog box setup
+            
+            if (event == '-STIRROFF-'):
+                window_1['-STIRROFF-'].update(button_color=('navy','white')) # These are to toggle the appearance of the buttons to match the commands
+                window_1['-STIRRON-'].update(button_color=('white','navy'))
+                self.stirr_on = False
+            if (event == '-STIRRON-'):
+                self.stirr_on = True
+                window_1['-STIRRON-'].update(button_color=('navy','white'))
+                window_1['-STIRROFF-'].update(button_color=('white','navy'))
+        
+            if (event == '-HEATOFF-'):
+                window_1['-HEATOFF-'].update(button_color=('navy','white'))
+                window_1['-HEATON-'].update(button_color=('white','navy'))
+                self.heat_on = False
+            if (event == '-HEATON-'):
+                window_1['-HEATON-'].update(button_color=('navy','white'))
+                window_1['-HEATOFF-'].update(button_color=('white','navy'))
+                self.heat_on = True
+                
+            if (event == '-SOUNDOFF-'):
+                window_1['-SOUNDOFF-'].update(button_color=('navy','white'))
+                window_1['-SOUNDSHRT-'].update(button_color=('white','navy'))
+                window_1['-SOUNDMED-'].update(button_color=('white','navy'))
+                window_1['-SOUNDLONG-'].update(button_color=('white','navy'))
+                self.sound_sh_on = False
+                self.sound_m_on = False
+                self.sound_l_on = False
+            if (event == '-SOUNDSHRT-'):
+                window_1['-SOUNDSHRT-'].update(button_color=('navy','white'))
+                window_1['-SOUNDOFF-'].update(button_color=('white','navy'))
+                window_1['-SOUNDMED-'].update(button_color=('white','navy'))
+                window_1['-SOUNDLONG-'].update(button_color=('white','navy'))
+                self.sound_sh_on = True
+                self.sound_m_on = False
+                self.sound_l_on = False
+            if (event == '-SOUNDMED-'):
+                window_1['-SOUNDMED-'].update(button_color=('navy','white'))
+                window_1['-SOUNDOFF-'].update(button_color=('white','navy'))
+                window_1['-SOUNDSHRT-'].update(button_color=('white','navy'))
+                window_1['-SOUNDLONG-'].update(button_color=('white','navy'))
+                self.sound_m_on = True
+                self.sound_sh_on = False
+                self.sound_l_on = False
+            if (event == '-SOUNDLONG-'):
+                window_1['-SOUNDLONG-'].update(button_color=('navy','white'))
+                window_1['-SOUNDOFF-'].update(button_color=('white','navy'))
+                window_1['-SOUNDSHRT-'].update(button_color=('white','navy'))
+                window_1['-SOUNDMED-'].update(button_color=('white','navy'))
+                self.sound_l_on = True
+                self.sound_sh_on = False
+                self.sound_m_on = False
+    
+            if (event == '-VALVCLSD-'):
+                window_1['-VALVCLSD-'].update(button_color=('navy','white'))
+                window_1['-VALVOPEN-'].update(button_color=('white','navy'))
+                valvopen = False
+    
+            if (event == '-VALVOPEN-'):
+                window_1['-VALVOPEN-'].update(button_color=('navy','white'))
+                window_1['-VALVCLSD-'].update(button_color=('white','navy'))
+                valvopen = True
+                
+            if (event == '-SENDONOFF-'): # This sends the settings to the microcontroller to send to orbit shaker
+        
+                self.Set_On_Off(self.stirr_on, self.heat_on, self.sound_sh_on, self.sound_m_on, self.sound_l_on, self.devaddr, self.ram_HS_OnOff, self.max_wait)
+    
+            if (event == '-SENDVALV-'):
+                self.Set_Gas_Valve(valvopen,1)
+            
+            if (event == "-SENDTS-"):
+                print("Temp setpoint = "+values["-INPUT1-"]+" C")
+                if (values['-INPUT1-'] != ''):  # Sets value only if field is not empty, if field empty, stays at 0
+                    t_set = float(values["-INPUT1-"])
+        
+                self.Temp_Set(t_set, self.max_wait)            # Translates intended values into binary commands, sends to RS9000 and checks receipt
+               
+            if (event == "-SENDTR-"):
+                print("Temp ramp = "+values["-INPUT2-"]+" C/min")
+                if (values['-INPUT2-'] != ''):
+                    t_ramp_set = float(values["-INPUT2-"])
+                    
+                self.Temp_Ramp_Set(t_ramp_set, self.max_wait)
+                           
+            if (event == "-SENDSS-"):
+                print("Stirrer speed = "+values["-INPUT3-"])
+                if (values['-INPUT3-'] != ''):
+                    a_speed_set = float(values["-INPUT3-"])
+                    
+                self.Speed_Set(a_speed_set, self.max_wait)
+                
+            if (event == "-SENDSR-"):
+                print("Stirrer ramp = "+values["-INPUT4-"])
+                if (values['-INPUT4-'] != ''):
+                    a_ramp_set = float(values["-INPUT4-"])
+        
+                self.Set_Speed_Ramp(a_ramp_set, self.max_wait)
+                
+            if (event == '-FINISH-'):
+                try:
+                    self.Process_Monitor_Dialog(self.steps_s,self.steps_r,self.segs,self.step_num,\
+                                                self.first_both,self.first_stirr,self.first_heat,\
+                                       self.heat_on,self.stirr_on,self.timer_started,self.timer_stopped,\
+                                       self.proc_status,self.ramp_1_0_time,self.logs_on,self.logs_started)
+                except:
+                    sg.popup("Process monitor could not be started, please check input parameters and try again")
+                    print("Process monitor could not be started, please check input parameters and try again")
+                break
+            
+            if ((event == '-BACK-') or (event == sg.WIN_CLOSED)):
+                break
+            
+        window_1.close()
+
+    def Process_Setup_Dialog(self):
+    
+        line2_0 = sg.Text("Set up Process",font=('Arial Bold',16))
+        
+        line_brwse = sg.Text("Select input file (if using)", key='-OUT-',expand_x=True, justification='left')
+        box_brwse = sg.Input(self.dflt_in_path,key = '-FINPUT-')
+        b_brwse = sg.FileBrowse('Browse', key='-BROWSE-')
+        
+        b_fill = sg.Button("Fill",key='-FILL-',button_color='navy')
+        
+        b_dflt = sg.Button("Use Default Ramp",key='-DFLT-',button_color=('navy','white'))
+        
+        line2_1 = sg.Text("Temperature setpoint in C, (0.1 C precision)                        ", key='-OUT-',expand_x=True, justification='left')
+        box2_1 = sg.Input('', enable_events=True,key='-INPUT2_1-', expand_x=True, justification='left')
+        line2_2 = sg.Text("Temperature ramp to setpoint in C per min, (0.1 C precision)", key='-OUT-',expand_x=True, justification='left')
+        box2_2 = sg.Input('', enable_events=True,key='-INPUT2_2-', expand_x=True, justification='left')
+        line2_3 = sg.Text("Dwell time at temp setpoint in mins, (0.1 precision)             ", key='-OUT-',expand_x=True, justification='left')
+        box2_3 = sg.Input('', enable_events=True,key='-INPUT2_3-', expand_x=True, justification='left')
+        
+        line2_4 = sg.Text("Stirrer setpoint 1 in RPM, (1 RPM precision)                      ", key='-OUT-',expand_x=True, justification='left')
+        box2_4 = sg.Input('', enable_events=True,key='-INPUT2_4-', expand_x=True, justification='left')
+        line2_5 = sg.Text("Stirrer ramp to setpoint 1 in minutes, (0.1 min precision)     ", key='-OUT-',expand_x=True, justification='left')
+        box2_5 = sg.Input('', enable_events=True,key='-INPUT2_5-', expand_x=True, justification='left')
+        
+        line2_8 = sg.Text("Dwell time at stirr setpoint 1 in mins, (0.1 precision)           ", key='-OUT-',expand_x=True, justification='left')
+        box2_8 = sg.Input('', enable_events=True,key='-INPUT2_6-', expand_x=True, justification='left')
+        
+        line2_6 = sg.Text("Stirrer setpoint 2 in RPM, (1 RPM precision)                      ", key='-OUT-',expand_x=True, justification='left')
+        box2_6 = sg.Input('', enable_events=True,key='-INPUT2_7-', expand_x=True, justification='left')
+        line2_7 = sg.Text("Stirrer ramp to setpoint 2 in minutes, (0.1 min precision)     ", key='-OUT-',expand_x=True, justification='left')
+        box2_7 = sg.Input('', enable_events=True,key='-INPUT2_8-', expand_x=True, justification='left')
+        
+        line2_9 = sg.Text("(Dwell time for stirrer will be matched to temp dwell)", key='-OUT-',expand_x=True, justification='left')
+        
+        line2_10 = sg.Text("Start order for heating and stirring", font=('Arial Bold',12))
+        b2_10 = sg.Button("Heater First",key='-HEAT1ST-', button_color='navy')
+        b2_11 = sg.Button("Stirrer First", key='-STIRR1ST-', button_color='navy')
+        b2_12 = sg.Button("Same Time", key = '-BOTH1ST-', button_color=('navy', 'white'))
+    
+        line2_11 = sg.Text("Gas valve opening trigger", font=('Arial Bold',12))
+        b2_13 = sg.Button("Manual", key='-MANTRIG-', button_color=('navy','white'))
+        b2_14 = sg.Button("Top Temp", key='-HEATTRIG-', button_color='navy')
+        b2_15 = sg.Button("Top Speed", key='-AGITTRIG-', button_color='navy')
+        b2_16 = sg.Button("Both Top", key='-BOTHTRIG-', button_color='navy')
+        
+        start_b_2 = sg.Button("Start Process", key='-START2-', button_color='navy')
+        end_b_2 = sg.Button("Back", key='-QUIT2-', button_color='navy')
+        log_b_1 = sg.Button("Logging Off", key='-LOGOFF-',button_color=('navy', 'white'))
+        log_b_2 = sg.Button("Logging On", key='-LOGON-',button_color='navy') 
+        
+        layout_2 = [[line2_0],\
+                  [],\
+                  [line_brwse,box_brwse,b_brwse],\
+                  [b_dflt,b_fill],\
+                  [line2_1,box2_1],\
+                  [line2_2,box2_2],\
+                  [line2_3,box2_3],\
+                  [],\
+                  [line2_4,box2_4],\
+                  [line2_5,box2_5],\
+                  [line2_8,box2_8],\
+                  [line2_6,box2_6],\
+                  [line2_7,box2_7],\
+                  [line2_9],\
+                  [],\
+                  [line2_10],\
+                  [b2_10, b2_11, b2_12],\
+                  [line2_11],\
+                  [b2_13, b2_14, b2_15, b2_16],\
+                  [log_b_1,log_b_2],\
+                  [start_b_2],\
+                
+                  [end_b_2]]
+        
+        window_2 = sg.Window("Orbit Shaker Process Setup", layout_2, size=(750,580))
+        
+        dflt_ramp_on = True
+    
+        first_heat = False
+        first_stirr = False
+        first_both = True
+    
+        valve_trig = "ManTrig"  # Assumes the gas valve will only trigger manually unless told otherwise
+        
+        while True:
+            event, values = window_2.read() # 'window2' was defined in the dialog box setup
+            
+            if ((event == '-DFLT-') and (dflt_ramp_on == True)):
+                window_2['-DFLT-'].update(button_color=('white','navy'))
+                dflt_ramp_on = False
+            elif ((event == '-DFLT-') and (dflt_ramp_on == False)):
+                window_2['-DFLT-'].update(button_color=('navy','white'))
+                dflt_ramp_on = True
+        
+            if (event == '-HEAT1ST-'):
+                window_2['-HEAT1ST-'].update(button_color=('navy','white'))
+                window_2['-STIRR1ST-'].update(button_color=('white','navy'))
+                window_2['-BOTH1ST-'].update(button_color=('white','navy'))
+                first_heat = True
+                first_stirr = False
+                first_both = False
+            if (event == '-STIRR1ST-'):
+                window_2['-STIRR1ST-'].update(button_color=('navy','white'))
+                window_2['-HEAT1ST-'].update(button_color=('white','navy'))
+                window_2['-BOTH1ST-'].update(button_color=('white','navy'))
+                first_heat = False
+                first_stirr = True
+                first_both = False
+            if (event == '-BOTH1ST-'):
+                window_2['-BOTH1ST-'].update(button_color=('navy','white'))
+                window_2['-HEAT1ST-'].update(button_color=('white','navy'))
+                window_2['-STIRR1ST-'].update(button_color=('white','navy'))
+                first_heat = False
+                first_stirr = False
+                first_both = True
+    
+            if (event == '-HEATTRIG-'):
+                window_2['-HEATTRIG-'].update(button_color=('navy','white'))
+                window_2['-AGITTRIG-'].update(button_color=('white','navy'))
+                window_2['-BOTHTRIG-'].update(button_color=('white','navy'))
+                window_2['-MANTRIG-'].update(button_color=('white','navy'))
+                valve_trig = "HeatTrig"
+                
+            if (event == '-AGITTRIG-'):
+                window_2['-AGITTRIG-'].update(button_color=('navy','white'))
+                window_2['-HEATTRIG-'].update(button_color=('white','navy'))
+                window_2['-BOTHTRIG-'].update(button_color=('white','navy'))
+                window_2['-MANTRIG-'].update(button_color=('white','navy'))
+                valve_trig = "AgitTrig"
+                
+            if (event == '-BOTHTRIG-'):
+                window_2['-BOTHTRIG-'].update(button_color=('navy','white'))
+                window_2['-HEATTRIG-'].update(button_color=('white','navy'))
+                window_2['-AGITTRIG-'].update(button_color=('white','navy'))
+                window_2['-MANTRIG-'].update(button_color=('white','navy'))
+                valve_trig = "BothTrig"
+                
+            if (event == '-MANTRIG-'):
+                window_2['-MANTRIG-'].update(button_color=('navy','white'))
+                window_2['-HEATTRIG-'].update(button_color=('white','navy'))
+                window_2['-AGITTRIG-'].update(button_color=('white','navy'))
+                window_2['-BOTHTRIG-'].update(button_color=('white','navy'))
+                valve_trig = "ManTrig"
+                
+    
+        
+            if (event == '-LOGON-'):
+                logs_on = True
+                window_2['-LOGON-'].update(button_color=('navy','white'))
+                window_2['-LOGOFF-'].update(button_color=('white','navy'))
+        
+            if (event == '-LOGOFF-'):
+                logs_on = False
+                window_2['-LOGOFF-'].update(button_color=('navy','white'))
+                window_2['-LOGON-'].update(button_color=('white','navy'))
+                
+            if (event == '-FILL-'):
+                
+    
+                if (dflt_ramp_on == True):
+                    inp_list = []
+                    try:
+                        with open(self.dflt_ramp_file_path,encoding = 'utf-8-sig') as csvfile:   # First inserts the default ramp values (will also do this if not input file is selected)
+                            reader=csv.reader(csvfile, delimiter = ',')
+                            for row in reader:
+                                inp_list.append(row[1]) # Makes a list of the default ramp values reading from default file
+                    except:
+                        sg.popup("No suitable default ramp parameters file found, please try again or swtich off default ramp")
+                        print("No suitable default ramp parameters file found, please try again or swtich off default ramp")
+                        inp_list = ['0']*10
+    
+                else:
+                    inp_list = ['0']*10
+                
+                if (path.exists(values['-FINPUT-']) == True):
+                    
+                    if (values['-FINPUT-'][-4:]=='.csv'):
+                    
+                        inp_file_path = values['-FINPUT-']
+        
+                                
+                        with open(inp_file_path,encoding = 'utf-8-sig') as csvfile:     # Then inserts the max speed and temp from the user-selected file
+                            reader=csv.reader(csvfile, delimiter = ',')
+                            k = 0
+                            for row in reader:
+                                if (k == 1):
+                                    try:
+                                        inp_list[2] = row[4]    # Temp setpoint
+                                        inp_list[8] = row[5]    # Speed setpoint
+                                        inp_list[4] = row[6]    # Dwell time
+                                    
+                                        inp_list[9] = str(int(((float(inp_list[8]) - float(inp_list[5]))/self.dflt_ramp)))     # Calculates ramp based on default value
+                                        print("Stirr 1: "+str(inp_list[5]))
+                                        print("Stirr 2: "+str(float(row[4])))
+                                        print("Ramp 2: "+str(inp_list[9]))
+                                        
+                                    except:
+                                        sg.popup("File does not match expected format, default values only are used, ramp to final stirr speed could not be calculated")
+                                        print("File does not match expected format, default values only are used, ramp to final stirr speed could not be calculated")
+                                        
+                                    break                   # Only second line needs to be read
+                                k = k + 1
+                    else:
+                        sg.popup("Please select a CSV file")
+                            
+                if (inp_list[0] =='Heater'):
+                    window_2['-HEAT1ST-'].update(button_color=('navy','white'))
+                    window_2['-STIRR1ST-'].update(button_color=('white','navy'))
+                    window_2['-BOTH1ST-'].update(button_color=('white','navy'))
+                    first_heat = True
+                    first_stirr = False
+                    first_both = False
+                    
+                if (inp_list[0] =='Stirrer'):
+                    window_2['-STIRR1ST-'].update(button_color=('navy','white'))
+                    window_2['-HEAT1ST-'].update(button_color=('white','navy'))
+                    window_2['-BOTH1ST-'].update(button_color=('white','navy'))
+                    first_heat = False
+                    first_stirr = True
+                    first_both = False
+                    
+                if (inp_list[0] =='Both'):
+                    window_2['-BOTH1ST-'].update(button_color=('navy','white'))
+                    window_2['-HEAT1ST-'].update(button_color=('white','navy'))
+                    window_2['-STIRR1ST-'].update(button_color=('white','navy'))
+                    first_heat = False
+                    first_stirr = False
+                    first_both = True
+                    
+                if (inp_list[1] =='On'):
+                    logs_on = True
+                    window_2['-LOGON-'].update(button_color=('navy','white'))
+                    window_2['-LOGOFF-'].update(button_color=('white','navy'))
+                    
+                if (inp_list[1] =='Off'):
+                    logs_on = False
+                    window_2['-LOGOFF-'].update(button_color=('navy','white'))
+                    window_2['-LOGON-'].update(button_color=('white','navy'))
+                    
+                for j in range(2,10):   # Populates the input fields with the parameters from the defaults file
+                    window_2['-INPUT2_'+str(j-1)+'-'].update(inp_list[j])
+                                          
+                
+        
+            if (event == '-START2-'):
+        
+                if (values['-INPUT2_1-'] != ''):
+                    t_set = float(values['-INPUT2_1-'])
+                else:
+                    t_set = 0
+                print(t_set)
+                if (values['-INPUT2_2-'] != ''):
+                    t_ramp_set = float(values["-INPUT2_2-"])
+                else:
+                    t_ramp_set = 0
+                print(t_ramp_set)
+                if (values['-INPUT2_3-'] != ''):
+                    dwell_time = float(values['-INPUT2_3-'])
+                else:
+                    dwell_time = 0
+                print(dwell_time)
+                if (values['-INPUT2_4-'] != ''):
+                    a_speed_set = float(values["-INPUT2_4-"])
+                else:
+                    a_speed_set = 0
+                print(a_speed_set)
+                if (values['-INPUT2_5-'] != ''):
+                    self.a_ramp_set = float(values["-INPUT2_5-"])
+                else:
+                    self.a_ramp_set = 0
+                print(self.a_ramp_set)
+                if (values['-INPUT2_6-'] != ''):
+                    self.dwell_time_sp1 = float(values['-INPUT2_6-'])
+                else:
+                    self.dwell_time_sp1 = 0
+                if (values['-INPUT2_7-'] != ''):
+                    a_speed_set_2 = float(values["-INPUT2_7-"])
+                else:
+                    a_speed_set_2 = 0
+                print(a_speed_set_2)
+                if (values['-INPUT2_8-'] != ''):
+                    a_ramp_set_2 = float(values["-INPUT2_8-"])
+                else:
+                    a_ramp_set_2 = 0
+                print(a_ramp_set_2)
+                if ((values['-INPUT2_1-'] != '') and (values['-INPUT2_2-'] != '')):
+                    ramp_time = (t_set/t_ramp_set)
+                else:
+                    ramp_time = 0
+                print(ramp_time)
+        
+        
+                if (t_set <= self.t_set_max):
+                    self.Temp_Set(t_set, self.max_wait)
+                    sleep(0.01) # 10 ms are left between each command as the RS9000 will be ready for a new command after 7 ms
+        
+                if (t_ramp_set <= self.t_ramp_max):
+                    self.Temp_Ramp_Set(t_ramp_set, self.max_wait)
+                    sleep(0.01)
+                    
+                a_set_0_high, a_set_0_low = self.Two_Byte_Read(self.devaddr,self.ram_agit_meas_read_high,self.ram_agit_meas_read_low) # Reads the current speed to take as starting point for ramping
+            
+                if ((a_set_0_high != -1) and (a_set_0_low != -1)):
+                    self.a_speed_0 = float(self.Agit_Bin_Read(a_set_0_high, a_set_0_low))
+                else:
+                    self.a_speed_0 = 0.0
+        
+                self.steps_s = []
+                self.steps_r = []
+    
+                print('a_speed_0: '+str(self.a_speed_0))
+                
+                self.steps_s, self.steps_r, self.step_num = self.Get_Ramp_List(self.steps_s,self.steps_r,self.a_speed_0,a_speed_set,self.a_ramp_set,self.dwell_time_sp1) # Adds ramp steps to the provided list based on paramaters chosen
+    
+                print(self.steps_s)
+                print(self.steps_r)
+                
+                self.steps_to_speed_1=len(self.steps_s)
+        
+                print('a_speed_set: '+str(a_speed_set))
+                        
+                self.steps_s, self.steps_r, self.step_num = self.Get_Ramp_List(self.steps_s,self.steps_r,a_speed_set,a_speed_set_2,a_ramp_set_2,0)
+    
+                print(self.steps_s)
+                print(self.steps_r)
+        
+                print("Speed Steps: "+str(self.steps_s))
+                print("Speed Ramp Steps: "+str(self.steps_r))
+                
+                self.Speed_Set(self.steps_s[0], self.max_wait)
+                sleep(0.01)
+                self.Set_Speed_Ramp(self.steps_r[0], self.max_wait)
+                sleep(0.01)
+                
+                self.stirr_on = False
+                self.heat_on = False
+                self.sound_sh_on = False
+                self.sound_m_on = True
+                self.sound_l_on = False
+        
+                if (first_heat == True):
+                    self.heat_on = True
+                    proc_status = 'RampHeat'
+                    self.Set_On_Off(self.stirr_on, self.heat_on, self.sound_sh_on, self.sound_m_on,\
+                                    self.sound_l_on, self.devaddr, self.ram_HS_OnOff, self.max_wait)
+                    self.sound_m_on = False
+                    self.ramp_1_0_time = time()      # This takes note of when the ramp was started, to ensure ramping is not faster than intended
+        
+                    self.logs_started = False
+                    
+                    self.Process_Monitor_Dialog(self.steps_s,self.steps_r,self.segs,self.step_num,\
+                                                self.first_both,self.first_stirr,self.first_heat,valve_trig,\
+                                       self.heat_on,self.stirr_on,self.dwell_time,self.timer_started,self.timer_stopped,\
+                                        proc_status,self.ramp_1_0_time,self.logs_on,self.logs_started)
+                    sleep(0.01)
+        
+                elif (first_stirr == True):
+                    self.stirr_on = True
+                    proc_status = 'RampStirr'
+                    self.Set_On_Off(self.stirr_on, self.heat_on, self.sound_sh_on, self.sound_m_on,\
+                                    self.sound_l_on, self.devaddr, self.ram_HS_OnOff, self.max_wait)
+                    self.sound_m_on = False
+                    self.ramp_1_0_time = time()      # This takes note of when the ramp was started, to ensure ramping is not faster than intended
+        
+                    self.logs_started = False
+                    
+                    self.Process_Monitor_Dialog(self.steps_s,self.steps_r,self.segs,self.step_num,\
+                                                self.first_both,self.first_stirr,self.first_heat,valve_trig,\
+                                       self.heat_on,self.stirr_on,self.dwell_time,self.timer_started,self.timer_stopped,\
+                                        proc_status,self.ramp_1_0_time,self.logs_on,self.logs_started)
+                    
+                    sleep(0.01)
+                    
+                else:
+                    self.heat_on = True
+                    self.stirr_on = True
+                    self.proc_status = 'RampHeat&Stirr'
+                    self.Set_On_Off(self.stirr_on, self.heat_on, self.sound_sh_on, self.sound_m_on,\
+                                    self.sound_l_on,self.devaddr, self.ram_HS_OnOff, self.max_wait)
+                    self.sound_m_on = False
+                    self.ramp_1_0_time = time()      # This takes note of when the ramp was started, to ensure ramping is not faster than intended
+        
+                    self.logs_started = False
+                    
+                    self.Process_Monitor_Dialog(self.steps_s,self.steps_r,self.segs,self.step_num,\
+                                                self.first_both,self.first_stirr,self.first_heat,valve_trig,\
+                                       self.heat_on,self.stirr_on,self.dwell_time,self.timer_started,self.timer_stopped,\
+                                       self.proc_status,self.ramp_1_0_time,self.logs_on,self.logs_started)
+                    
+                    sleep(0.01)
+        
+                
+        
+                break
+        
+        
+        
+            if (event == '-QUIT2-' or event == sg.WIN_CLOSED):
+                break
+        
+        window_2.close()
+
+
+    def Process_Monitor_Dialog(self,steps_s,steps_r,segs,step_num,first_both,first_stirr,first_heat,valve_trig,\
+                       heat_on,stirr_on,dwell_time,timer_started,timer_stopped,\
+                       proc_status,ramp_1_0_time,logs_on,logs_started):
+    
+    
+        line3_0 = sg.Text("Process Monitor Dashboard",font=('Arial Bold',16))
+        
+        line3_1 = sg.Text("Temperature setpoint in C", key='-OUT-', font=('Arial',14), expand_x=True, justification='left')
+        box3_1 = sg.Text('0', enable_events=True,key='-OUTPUT3_1-', font = ('Arial Bold', 18), text_color='lime', background_color='black', expand_x=True, justification='left')
+        inp3_1 = sg.Input("",size=(50,None),key="-INPUT3_1-")
+        bt3_1 = sg.Button("Adjust", key='-ADJ3_1-', button_color='navy')
+        line3_1_1 = sg.Text("Temperature ramp in C/min", key='-OUT-', font=('Arial',14), expand_x=True, justification='left')
+        box3_1_1 = sg.Text('0', enable_events=True,key='-OUTPUT3_1_1-', font = ('Arial Bold', 18), text_color='lime', background_color='black', expand_x=True, justification='left')
+        inp3_1_1 = sg.Input("",size=(50,None),key="-INPUT3_1_1-")
+        bt3_1_1 = sg.Button("Adjust", key='-ADJ3_1_1-', button_color='navy')
+        
+        
+        line3_2 = sg.Text("Internal Temperature in C", key='-OUT-', font=('Arial',14), expand_x=True, justification='left')
+        box3_2 = sg.Text('0', enable_events=True,key='-OUTPUT3_2-', font = ('Arial Bold', 18), text_color='lime', background_color='black', expand_x=True, justification='left')
+        line3_2_1 = sg.Text("External Temperature in C", key='-OUT-', font=('Arial',14), expand_x=True, justification='left')
+        box3_2_1 = sg.Text('0', enable_events=True,key='-OUTPUT3_2_1-', font = ('Arial Bold', 18), text_color='lime', background_color='black', expand_x=True, justification='left')
+        
+        line3_2_2 = sg.Text("Stirrer setpoint 1 in RPM", key='-OUT-', font=('Arial',14), expand_x=True, justification='left')
+        box3_2_2 = sg.Text('0', enable_events=True,key='-OUTPUT3_2_2-', font = ('Arial Bold', 18), text_color='lime', background_color='black', expand_x=True, justification='left')
+        inp3_2_2 = sg.Input("",size=(50,None),key="-INPUT3_2_2-")
+        bt3_2_2 = sg.Button("Adjust", key='-ADJ3_2_2-', button_color='navy')
+        line3_2_3 = sg.Text("Stirrer setpoint 2 in RPM", key='-OUT-', font=('Arial',14), expand_x=True, justification='left')
+        box3_2_3 = sg.Text('0', enable_events=True,key='-OUTPUT3_2_3-', font = ('Arial Bold', 18), text_color='lime', background_color='black', expand_x=True, justification='left')
+        inp3_2_3 = sg.Input("",size=(50,None),key="-INPUT3_2_3-")
+        bt3_2_3 = sg.Button("Adjust", key='-ADJ3_2_3-', button_color='navy')
+        
+        line3_3 = sg.Text("Stirrer setpoint (current step) in RPM", key='-OUT-', font=('Arial',14), expand_x=True, justification='left')
+        box3_3 = sg.Text('0', enable_events=True,key='-OUTPUT3_3-', font = ('Arial Bold', 18), text_color='lime', background_color='black', expand_x=True, justification='left')
+        inp3_3 = sg.Input("",size=(50,None),key="-INPUT3_3-")
+        bt3_3 = sg.Button("Adjust", key='-ADJ3_3-', button_color='navy')
+        line3_3_1 = sg.Text("Stirrer ramp in mins", key='-OUT-', font=('Arial',14), expand_x=True, justification='left')
+        box3_3_1 = sg.Text('0', enable_events=True,key='-OUTPUT3_3_1-', font = ('Arial Bold', 18), text_color='lime', background_color='black', expand_x=True, justification='left')
+        inp3_3_1 = sg.Input("",size=(50,None),key="-INPUT3_3_1-")
+        bt3_3_1 = sg.Button("Adjust", key='-ADJ3_3_1-', button_color='navy')
+        
+        line3_4 = sg.Text("Measured stirrer speed in RPM", key='-OUT-', font=('Arial',14), expand_x=True, justification='left')
+        box3_4 = sg.Text('0', enable_events=True,key='-OUTPUT3_4-', font = ('Arial Bold', 18), text_color='lime', background_color='black', expand_x=True, justification='left')
+        
+        line3_5 = sg.Text("Heater power in %", key='-OUT-',font=('Arial',14), expand_x=True, justification='left')
+        box3_5 = sg.Text('0', enable_events=True,key='-OUTPUT3_5-', font = ('Arial Bold', 18), text_color='lime', background_color='black', expand_x=True, justification='left')
+        
+        line3_7 = sg.Text("Heater status (On/Off)", key='-OUT-',font=('Arial',14), expand_x=True, justification='left')
+        box3_7 = sg.Text('Off', enable_events=True,key='-OUTPUT3_7-', font = ('Arial Bold', 18), text_color='lime', background_color='black', expand_x=True, justification='left')
+        line3_8 = sg.Text("Stirrer status (On/Off)", key='-OUT-',font=('Arial',14), expand_x=True, justification='left')
+        box3_8 = sg.Text('Off', enable_events=True,key='-OUTPUT3_8-', font = ('Arial Bold', 18), text_color='lime', background_color='black', expand_x=True, justification='left')
+        
+        line3_9 = sg.Text("Machine error status", key='-OUT-',font=('Arial',14), expand_x=True, justification='left')
+        box3_9 = sg.Text('No errors', enable_events=True,key='-OUTPUT3_9-', font = ('Arial Bold', 18), text_color='lime', background_color='black', expand_x=True, justification='left')
+        
+        line3_10 = sg.Text("Progress", key='-OUT-',font=('Arial',14), expand_x=True, justification='left')
+        box3_10 = sg.Text('Manual', enable_events=True,key='-OUTPUT3_10-', font = ('Arial Bold', 18), text_color='lime', background_color='black', expand_x=False, justification='left')
+        
+        line3_11 = sg.Text("Time elapsed on step (s)", key='-OUT-',font=('Arial',14), expand_x=True, justification='left')
+        box3_11 = sg.Text('0', enable_events=True,key='-OUTPUT3_11-', font = ('Arial Bold', 18), text_color='lime', background_color='black', expand_x=False, justification='left')
+        
+        line3_12 = sg.Text("Time remaining on step (s)", key='-OUT-',font=('Arial',14), expand_x=True, justification='left')
+        box3_12 = sg.Text('0', enable_events=True,key='-OUTPUT3_12-', font = ('Arial Bold', 18), text_color='lime', background_color='black', expand_x=False, justification='left')
+    
+        valve_b_1 = sg.Button("Open Valve", key='-VALV-', button_color='navy')
+        
+        stop_b_3 = sg.Button("Stop Process", key='-STOP3-', button_color='navy')
+        
+        end_b_3 = sg.Button("Exit", key='-QUIT3-', button_color='navy')
+        
+        layout_3 = [[line3_0],\
+                  [],\
+                  [line3_2,box3_2],\
+                  [line3_2_1,box3_2_1],\
+                  [line3_4,box3_4],\
+                  [line3_5,box3_5],\
+                  [line3_7,box3_7],\
+                  [line3_8,box3_8],\
+                  [line3_9,box3_9],\
+                  [line3_10,box3_10],\
+                  [line3_11,box3_11],\
+                  [line3_12,box3_12],\
+                  [],\
+                  [line3_1,box3_1,inp3_1,bt3_1],\
+                  [line3_1_1,box3_1_1,inp3_1_1,bt3_1_1],\
+                  [],\
+                  [line3_2_2,box3_2_2,inp3_2_2,bt3_2_2],\
+                  [line3_2_3,box3_2_3,inp3_2_3,bt3_2_3],\
+                  [line3_3,box3_3,inp3_3,bt3_3],\
+                  [line3_3_1,box3_3_1,inp3_3_1,bt3_3_1],\
+                  [],\
+                  [valve_b_1],\
+                  [],\
+                  [stop_b_3],\
+                
+                  [end_b_3]]
+        
+        window_3 = sg.Window("Orbit Shaker Process Monitor", layout_3, size=(850,800))
+    
+        valve_status = self.Set_Gas_Valve(False,1)   # Closes gas valve during ramp up process
+        valve_triggered = False # Variable to keep track of whether the valve has been triggered yet, allowing users to manually open/close
+        
+        while True:
+            event, values = window_3.read(timeout=1000) # 'window_3' was defined in the dialog box setup, timeout is time (in ms) before window refreshes
+
+            print("Event: "+str(event))
+        
+            time_0 = time()
+            time_step_elapsed=time()-ramp_1_0_time
+            time_step_remaining=(steps_r[step_num-1]*60)-(time()-ramp_1_0_time)
+        
+            if (event == '-VALV-'): # Lets the user manually open/close the gas valve during the process
+                if (valve_status == "Off"):
+                    try:
+                        valve_status = self.Set_Gas_Valve(True,1)
+                        window_3['-VALV-'].update("Close Valve",button_color=('navy','white'))
+                    except:
+                        print("Could not open gas valve")
+                elif (valve_status == "On"):
+                    try:
+                        valve_status = self.Set_Gas_Valve(False,1)
+                        window_3['-VALV-'].update("Open Valve",button_color=('white','navy'))
+                    except:
+                        print("Could not close gas valve")
+                        
+            if (event=="-ADJ3_1-") and (values["-INPUT3_1-"]!=""): # Allows user to set the temp setpoint while sequence is running
+                temp_to_set=float(values["-INPUT3_1-"])
+                self.Temp_Set(temp_to_set, self.max_wait)
+                sleep(0.01) # 10 ms are left between each command as the RS9000 will be ready for a new command after 7 ms
+                
+            if (event=="-ADJ3_1_1-") and (values["-INPUT3_1_1-"]!=""): # Allows user to set the temp ramp while sequence is running
+                temp_ramp_to_set=float(values["-INPUT3_1_1-"])
+                print("Temp ramp to set: "+str(temp_ramp_to_set))
+                self.Temp_Ramp_Set(temp_ramp_to_set, self.max_wait)
+                sleep(0.01)
+                
+            if (event=="-ADJ3_3-") and (values["-INPUT3_3-"]!=""):# Allows user to set the immediate speed setpoint (step) while sequence is running
+                agit_to_set=float(values["-INPUT3_3-"])
+                self.Speed_Set(agit_to_set,self.max_wait)
+                sleep(0.01)
+                
+            if (event=="-ADJ3_3_1-") and (values["-INPUT3_3_1-"]!=""): # Allows user to set the immediate speed ramp (step) while sequence is running
+                agit_ramp_to_set=float(values["-INPUT3_3_1-"])
+                self.Set_Speed_Ramp(agit_ramp_to_set, self.max_wait)
+                sleep(0.01)
+                
+            if (event=="-ADJ3_2_2-") and (values["-INPUT3_2_2-"]!=""):
+                if (step_num<=self.steps_to_speed_1):
+                    a_speed_1_to_set=float(values["-INPUT3_2_2-"])
+                    steps_new_s_1=[]
+                    steps_new_r_1=[]
+                    steps_new_s_2=steps_s[self.steps_to_speed_1:]
+                    steps_new_r_2=steps_r[self.steps_to_speed_1:]
+                    steps_new_s_1, steps_new_r_1, step_num_new = self.Get_Ramp_List(steps_new_s_1, steps_new_r_1, self.a_speed_0,\
+                                                a_speed_1_to_set, self.a_ramp_set, self.dwell_time_sp1, st_num=step_num)
+                    steps_s=steps_new_s_1
+                    for i in range (0,len(steps_new_s_2)):
+                        steps_s.append(steps_new_s_2[i])
+                    steps_r=steps_new_r_1
+                    for i in range (0,len(steps_new_r_2)):
+                        steps_r.append(steps_new_r_2[i])
+                    print("New step list: "+str(steps_s))
+                    print("New ramp list: "+str(steps_r))
+
+                else:
+                    print("Speed setpoint 1 already passed, could not adjust")
+                    sg.popup("Speed setpoint 1 already passed, could not adjust")
+                
+            if (event=="-ADJ3_2_3-") and (values["-INPUT3_2_3-"]!=""):
+                if (step_num<len(steps_s)):
+                    a_speed_2_to_set=float(values["-INPUT3_2_3-"])
+                    steps_new_s_1=steps_s[0:self.steps_to_speed_1]
+                    steps_new_r_1=steps_r[0:self.steps_to_speed_1]
+                    steps_new_s_2=[]
+                    steps_new_r_2=[]
+                    steps_new_s_2, steps_new_r_2, step_num_new = self.Get_Ramp_List(steps_new_s_2, steps_new_r_2, steps_s[self.steps_to_speed_1],\
+                                                a_speed_2_to_set, self.a_ramp_set, 0, st_num=step_num)
+                    steps_s=steps_new_s_1
+                    for i in range (0,len(steps_new_s_2)):
+                        steps_s.append(steps_new_s_2[i])
+                    steps_r=steps_new_r_1
+                    for i in range (0,len(steps_new_r_2)):
+                        steps_r.append(steps_new_r_2[i])
+                    print("New step list: "+str(steps_s))
+                    print("New ramp list: "+str(steps_r))
+                    print("Steps to speed 1: "+str(self.steps_to_speed_1))
+                    
+                else:
+                    print("Timer already started, to change speed adjust immediate speed step")
+                    sg.popup("Timer already started, to change speed adjust immediate speed step")
+        
+                
+            print("Valve status: "+valve_status)
+            
+            temp_set_high, temp_set_low = self.Two_Byte_Read(self.devaddr,self.ram_temp_high,self.ram_temp_low) # Read the bytes for temperature setpoint
+            if ((temp_set_high != -1) and (temp_set_low != -1)):
+                temp_set_read = self.Temp_Bin_Read(temp_set_high, temp_set_low) # Translate the bytes into the temperature setpoint reading on the RS9000
+                print("Temp set read: "+str(temp_set_read))
+                
+            temp_ramp_dec = self.One_Byte_Read(self.devaddr, self.ram_temp_ramp) # Read the byte for temperature ramp
+            if (temp_ramp_dec != -1):
+                temp_ramp_read = self.Temp_Ramp_Bin_Read(temp_ramp_dec) # Translate the bytes into the temperature setpoint reading on the RS9000
+                print("Temp ramp read: "+str(temp_ramp_read))
+    
+            temp_meas_high, temp_meas_low = self.Two_Byte_Read(self.devaddr,self.ram_temp_meas_read_high,self.ram_temp_meas_read_low)
+            if ((temp_meas_high != -1) and (temp_meas_low != -1)):
+                temp_meas = self.Temp_Bin_Read(temp_meas_high, temp_meas_low)
+                print("Temp meas read: "+str(temp_meas))
+    
+            try:
+    
+                temp_meas_ext_high, temp_meas_ext_low = self.Two_Byte_Read(self.thermaddr,self.ram_temp_meas_ext_read_high,self.ram_temp_meas_ext_read_low)
+                if ((temp_meas_ext_high != -1) and (temp_meas_ext_low != -1)):
+                    if (len(str(temp_meas_ext_low))>2): # If the measured low value is more than two digits (e.g. 255) this is an error, likely because the thermocouple is grounded
+                        print("External thermocouple could not be read, junction may be grounded.")
+                    else:
+                        temp_meas_ext = float(str(temp_meas_ext_high)+'.'+str(temp_meas_ext_low))
+                        print("Temp meas ext: "+str(temp_meas_ext))
+            except:
+                print("External thermocouple could not be read.")
+                print("Temp meas ext: "+str(temp_meas_ext))
+                
+            agit_setpoint_1=steps_s[self.steps_to_speed_1-1]
+            agit_setpoint_2=steps_s[-1]
+                
+            agit_set_high, agit_set_low = self.Two_Byte_Read(self.devaddr,self.ram_agit_high,self.ram_agit_low)
+            if ((agit_set_high != -1) and (agit_set_low != -1)):
+                agit_set_read = self.Agit_Bin_Read(agit_set_high, agit_set_low)
+                print("Agit set read: "+str(agit_set_read))
+                
+            agit_ramp_dec = self.One_Byte_Read(self.devaddr, self.ram_agit_ramp) # Read the byte for temperature ramp
+            if (agit_ramp_dec != -1):
+                agit_ramp_read = self.Agit_Ramp_Bin_Read(agit_ramp_dec) # Translate the bytes into the temperature setpoint reading on the RS9000
+                print("Speed ramp read: "+str(agit_ramp_read))
+                
+            agit_meas_high, agit_meas_low = self.Two_Byte_Read(self.devaddr,self.ram_agit_meas_read_high,self.ram_agit_meas_read_low)
+            if ((agit_meas_high != -1) and (agit_meas_low != -1)):
+                agit_meas_read = self.Agit_Bin_Read(agit_meas_high, agit_meas_low)
+                print("Agit meas read: "+str(agit_meas_read))
+        
+            heat_pow = self.One_Byte_Read(self.devaddr,self.ram_heat_pow)
+            if (heat_pow != -1):
+                heat_per = self.Heat_Pow_Bin_Read(heat_pow)
+                print("Heat per read: "+str(heat_per))
+        
+            on_off_val = self.One_Byte_Read(self.devaddr,self.ram_HS_OnOff)
+            print("On/Off value: "+str(on_off_val))
+            if (on_off_val != -1):
+                try:
+                    heat_is_on, stirr_is_on = self.OnOff_Bin_Read(on_off_val)
+                except:
+                    print("Could not read I/O status, byte transfer error")
+                
+            err_byte = self.One_Byte_Read(self.devaddr,self.ram_errors)
+            if (err_byte != -1):
+                error_str = self.Err_Bin_Read(err_byte)
+                print("Err str read: "+str(error_str))
+        
+        
+                    
+            window_3['-OUTPUT3_1-'].update(str(temp_set_read))
+            window_3['-OUTPUT3_1_1-'].update(str(temp_ramp_read))
+            window_3['-OUTPUT3_2-'].update(str(temp_meas))
+            window_3['-OUTPUT3_2_1-'].update(str(temp_meas_ext))
+            window_3['-OUTPUT3_2_2-'].update(str(agit_setpoint_1))
+            window_3['-OUTPUT3_2_3-'].update(str(agit_setpoint_2))
+            window_3['-OUTPUT3_3-'].update(str(agit_set_read))
+            window_3['-OUTPUT3_3_1-'].update(str(agit_ramp_read))
+            window_3['-OUTPUT3_4-'].update(str(agit_meas_read))
+            window_3['-OUTPUT3_5-'].update(str(heat_per))
+        
+            window_3['-OUTPUT3_7-'].update(heat_is_on)
+            window_3['-OUTPUT3_8-'].update(stirr_is_on)
+            window_3['-OUTPUT3_9-'].update(error_str)
+            window_3['-OUTPUT3_10-'].update(proc_status)
+            window_3['-OUTPUT3_11-'].update(str(round(time_step_elapsed,0)))
+            window_3['-OUTPUT3_12-'].update(str(round(time_step_remaining,0)))
+
+
+            if ((logs_on == True) and (logs_started == False)):
+                log_dict = {}
+                log_headings = ['Time (s)','Temp Setpoint (C)','Temp Ramp (C/min)','Temp Internal (C)','Temp External (C)','Speed Setpoint Immediate (RPM)','Speed Setpoint 1 (RPM)','Speed Setpoint 2 (RPM)',\
+                                'Speed Ramp (mins)','Speed Measured (RPM)','Heater Power (%)','Stirrer Status (on/off)','Error Status','Process Status']
+                
+                times, temp_sps, temp_rmps, temp_ms, temp_ex_ms, speed_sps, speed_1_sps, speed_2_sps, speed_rmps, speed_ms, heat_pows, stirr_stats, err_stats, proc_stats = [],[],[],[],[],[],[],[],[],[],[],[],[],[]
+
+                times.append("0")
+                temp_sps.append(str(temp_set_read))
+                temp_rmps.append(str(temp_ramp_read))
+                temp_ms.append(str(temp_meas))
+                temp_ex_ms.append(str(temp_meas_ext))
+                speed_sps.append(str(agit_set_read))
+                speed_1_sps.append(str(agit_setpoint_1))
+                speed_2_sps.append(str(agit_setpoint_2))
+                speed_rmps.append(str(agit_ramp_read))
+                speed_ms.append(str(agit_meas_read))
+                heat_pows.append(str(heat_per))
+                stirr_stats.append(str(stirr_is_on))
+                err_stats.append(str(error_str))
+                proc_stats.append(str(proc_status))
+        
+                log_0 = time()
+                log_step_0 = time()
+        
+                logs_started = True
+    
+            if (valve_status == "On"):
+                window_3['-VALV-'].update("Close Valve",button_color=('navy','white')) # Checks if the valve has been opened/closed automatically and updates the button appearance
+            if (valve_status == "Off"):
+                window_3['-VALV-'].update("Open Valve",button_color=('white','navy'))
+        
+            if ((first_both == True) and (timer_started == False)):
+    
+                if(((temp_meas >= (temp_set_read-self.temp_tol)) and (temp_meas <= (temp_set_read+self.temp_tol))) and (valve_trig == "HeatTrig") and (valve_triggered == False)):
+                    try:
+                        valve_status = self.Set_Gas_Valve(True,1)
+                        valve_triggered = True  # Ensures that once the valve has been automatically triggered, the user can manually operate it without it resetting
+                    except:
+                        print("Could not open gas valve")
+                            
+                
+                if ((agit_meas_read >= (agit_set_read-self.agit_tol)) and (agit_meas_read <= (agit_set_read+self.agit_tol)) and (((time()-ramp_1_0_time)/60)>steps_r[step_num-1])):
+        
+                    
+                    if  (step_num == len(steps_s)):
+                        print("Starting Timer (Setpoint 2)")
+                        start_time = time()
+                        timer_started = True
+                        proc_status = "Timer Start"
+                        window_3['-OUTPUT3_10-'].update(proc_status)
+                        if (((valve_trig == "BothTrig") or (valve_trig == "AgitTrig")) and (valve_triggered == False)):
+                            try:
+                                valve_status = self.Set_Gas_Valve(True,1)
+                                valve_triggered = True # Ensures that once the valve has been automatically triggered, the user can manually operate it without it resetting
+                            except:
+                                print("Could not open gas valve")
+                        
+                    if (step_num < len(steps_s)):
+                        print("Partial ramp step reached")
+                        proc_status = "Speed step "+str(step_num+1)+"/"+str(len(steps_s))
+                        window_3['-OUTPUT3_10-'].update(proc_status)
+                        self.Set_Speed_Ramp(steps_r[step_num], self.max_wait)
+                        print("Setting ramp to: "+str(steps_r[step_num]))
+                        self.Speed_Set(steps_s[step_num], self.max_wait)
+                        print("Setting speed to: "+str(steps_s[step_num]))
+                        self.Set_On_Off(stirr_on, heat_on, self.sound_sh_on, self.sound_m_on, self.sound_l_on,\
+                                        self.devaddr, self.ram_HS_OnOff, self.max_wait)
+                        ramp_1_0_time = time()
+                        step_num=step_num+1
+                    
+        
+            if ((first_stirr == True) and (timer_started == False)):
+            
+                if ((agit_meas_read >= (agit_set_read-self.agit_tol)) and (agit_meas_read <= (agit_set_read+self.agit_tol)) and (heat_on == False) and (((time()-ramp_1_0_time)/60)>steps_r[step_num-1])):
+    
+                              
+                    if  ((step_num == len(steps_s)) and (heat_on == False)):
+                        print("Starting Heater")
+                        heat_on = True
+                        self.Set_On_Off(stirr_on, heat_on, self.sound_sh_on, self.sound_m_on, self.sound_l_on,\
+                                        self.devaddr, self.ram_HS_OnOff, self.max_wait)
+                        proc_status = "RampHeat"
+                        window_3['-OUTPUT3_10-'].update(proc_status)
+                        if ((valve_trig == "AgitTrig") and (valve_triggered == False)):
+                            try:
+                                valve_status = self.Set_Gas_Valve(True,1)
+                                valve_triggered = True # Ensures that once the valve has been automatically triggered, the user can manually operate it without it resetting
+                            except:
+                                print("Could not open gas valve")
+                        
+                    if ((step_num < len(steps_s)) and (heat_on == False)):
+                        print("Partial ramp step reached")
+                        proc_status = "Speed step "+str(step_num+1)+"/"+str(len(steps_s))
+                        window_3['-OUTPUT3_10-'].update(proc_status)
+                        self.Set_Speed_Ramp(steps_r[step_num], self.max_wait)
+                        print("Setting ramp to: "+str(steps_r[step_num]))
+                        self.Speed_Set(steps_s[step_num], self.max_wait)
+                        print("Setting speed to: "+str(steps_s[step_num]))
+                        self.Set_On_Off(stirr_on, heat_on, self.sound_sh_on, self.sound_m_on, self.sound_l_on,\
+                                        self.devaddr, self.ram_HS_OnOff, self.max_wait)
+                        ramp_1_0_time = time()
+                        step_num=step_num+1
+                    
+        
+                if((temp_meas >= (temp_set_read-self.temp_tol)) and (temp_meas <= (temp_set_read+self.agit_tol)) and (heat_on == True)):
+        
+                    print("Starting Timer")
+                    start_time = time()
+                    timer_started = True
+                    proc_status = "Timer Start"
+                    window_3['-OUTPUT3_10-'].update(proc_status)
+                    if (((valve_trig == "HeatTrig") or (valve_trig == "BothTrig")) and (valve_triggered == False)):
+                        try:
+                            valve_status = self.Set_Gas_Valve(True,1)
+                            valve_triggered = True # Ensures that once the valve has been automatically triggered, the user can manually operate it without it resetting
+                        except:
+                            print("Could not open gas valve")
+                    
+        
+            if ((first_heat == True) and (timer_started == False)):
+        
+                if((temp_meas >= (temp_set_read-self.temp_tol)) and (temp_meas <= (temp_set_read+self.temp_tol)) and (stirr_on == False)):
+        
+                        print("Starting Stirrer")
+                        stirr_on = True
+                        self.Set_On_Off(stirr_on, heat_on, self.sound_sh_on, self.sound_m_on, self.sound_l_on,\
+                                        self.devaddr, self.ram_HS_OnOff, self.max_wait)
+                        proc_status = "RampStirr"
+                        window_3['-OUTPUT3_10-'].update(proc_status)
+                        if ((valve_trig == "HeatTrig") and (valve_triggered == False)):
+                            try:
+                                valve_status = self.Set_Gas_Valve(True,1)
+                                valve_triggered = True
+                            except:
+                                print("Could not open gas valve")
+        
+            
+                if ((agit_meas_read >= (agit_set_read-self.agit_tol)) and (agit_meas_read <= (agit_set_read+self.agit_tol)) and (stirr_on == True) and (((time()-ramp_1_0_time)/60)>steps_r[step_num-1])):
+                            
+                    if  ((step_num == len(steps_s)) and (stirr_on == True)):
+                        print("Starting Timer")
+                        start_time = time()
+                        timer_started = True
+                        proc_status = "Timer Start"
+                        window_3['-OUTPUT3_10-'].update(proc_status)
+                        if (((valve_trig == "AgitTrig") or (valve_trig == "BothTrig")) and (valve_triggered == False)):
+                            try:
+                                valve_status = self.Set_Gas_Valve(True,1)
+                                valve_triggered = True
+                            except:
+                                print("Could not open gas valve")
+                        
+                    if ((step_num < len(steps_s)) and (stirr_on == True)):
+                        print("Partial ramp step reached")
+                        proc_status = "Speed step "+str(step_num+1)+"/"+str(len(steps_s))
+                        window_3['-OUTPUT3_10-'].update(proc_status)
+                        self.Set_Speed_Ramp(steps_r[step_num], self.max_wait)
+                        print("Setting ramp to: "+str(steps_r[step_num]))
+                        self.Speed_Set(steps_s[step_num], self.max_wait)
+                        print("Setting speed to: "+str(steps_s[step_num]))
+                        self.Set_On_Off(stirr_on, heat_on, self.sound_sh_on, self.sound_m_on, self.sound_l_on,\
+                                        self.devaddr, self.ram_HS_OnOff, self.max_wait)
+                        ramp_1_0_time = time()
+                        step_num=step_num+1
+                    
+        
+            if ((timer_started == True) and (timer_stopped == False)):
+                print("Time elapsed: "+str(round((time()-start_time),0))+" s")
+                print("Time remaining: "+str(round((dwell_time*60)-(time()-start_time)))+" s")
+                if ((round((dwell_time*60)-(time()-start_time))) >= 0):
+                    proc_status = str(round((dwell_time*60)-(time()-start_time)))
+                else:
+                    heat_on = False
+                    stirr_on = False
+                    self.Set_On_Off(stirr_on, heat_on, self.sound_sh_on, self.sound_m_on, self.sound_l_on,\
+                                    self.devaddr, self.ram_HS_OnOff, self.max_wait)
+                    proc_status = "Finished"
+                    window_3['-OUTPUT3_10-'].update(proc_status)
+                    timer_stopped = True
+                    try:
+                        valve_status = self.Set_Gas_Valve(False,1)
+                    except:
+                        print("Could not close gas valve")
+    
+                    if (logs_on == True):
+                    
+                        self.Save_Logs(log_dict,log_headings,times, temp_sps, temp_rmps, temp_ms, temp_ex_ms,\
+                                       speed_sps, speed_1_sps, speed_2_sps, speed_rmps, speed_ms, heat_pows, stirr_stats, err_stats, proc_stats)
+    
+                    sleep(5)
+    
+                    sg.popup("Process Finished")
+                    
+                    break
+        
+            if ((logs_on == True) and (time()-log_step_0)>self.log_step_size):
+        
+                time_log = round((time()-log_0),1)
+                
+                print('Logged Parameters')
+                print('Time (s): '+str(time_log))
+                print('Temp Setpoint (C): '+str(temp_set_read))
+                print('Temp Internal (C): '+str(temp_meas))
+                print('Temp External (C): '+str(temp_meas_ext))
+                print('Speed Setpoint (RPM): '+str(agit_set_read))
+                print('Speed Measured (RPM): '+str(agit_meas_read))
+                
+                print('Heater Power (%): '+str(heat_per))
+                print('Heater Status (on/off): '+str(heat_is_on))
+                print('Stirrer Status (on/off): '+str(stirr_is_on))
+                print('Error Status: '+str(error_str))
+                print('Process Status: '+str(proc_status))
+        
+                times.append("0")
+                temp_sps.append(str(temp_set_read))
+                temp_rmps.append(str(temp_ramp_read))
+                temp_ms.append(str(temp_meas))
+                temp_ex_ms.append(str(temp_meas_ext))
+                speed_sps.append(str(agit_set_read))
+                speed_1_sps.append(str(agit_setpoint_1))
+                speed_2_sps.append(str(agit_setpoint_2))
+                speed_rmps.append(str(agit_ramp_read))
+                speed_ms.append(str(agit_meas_read))
+                heat_pows.append(str(heat_per))
+                stirr_stats.append(str(stirr_is_on))
+                err_stats.append(str(error_str))
+                proc_stats.append(str(proc_status))
+                
+                log_step_0 = time()
+        
+        
+            if ((error_str == 'Motor high current error; ') and (self.al_sounded == False)):
+    
+                sleep(1)
+        
+                if (logs_on == True):
+    
+                    times.append("0")
+                    temp_sps.append(str(temp_set_read))
+                    temp_rmps.append(str(temp_ramp_read))
+                    temp_ms.append(str(temp_meas))
+                    temp_ex_ms.append(str(temp_meas_ext))
+                    speed_sps.append(str(agit_set_read))
+                    speed_1_sps.append(str(agit_setpoint_1))
+                    speed_2_sps.append(str(agit_setpoint_2))
+                    speed_rmps.append(str(agit_ramp_read))
+                    speed_ms.append(str(agit_meas_read))
+                    heat_pows.append(str(heat_per))
+                    stirr_stats.append(str(stirr_is_on))
+                    err_stats.append(str(error_str))
+                    proc_stats.append(str(proc_status))
+    
+                    try:
+                        valve_status = self.Set_Gas_Valve(False,1)
+                    except:
+                        print("Could not close gas valve")
+                    
+                    self.Save_Logs(log_dict,log_headings,times, temp_sps, temp_rmps, temp_ms, temp_ex_ms,\
+                                       speed_sps, speed_1_sps, speed_2_sps, speed_rmps, speed_ms, heat_pows, stirr_stats, err_stats, proc_stats)
+    
+                sg.popup("Motor Current Error, Please Reset RS9000")
+                        
+                break
+            
+            if (event == '-STOP3-'):
+                proc_status = "Abort"
+                window_3['-OUTPUT3_10-'].update(proc_status)
+                heat_on = False
+                stirr_on = False
+                self.Set_On_Off(stirr_on, heat_on, self.sound_sh_on, self.sound_m_on, self.sound_l_on,\
+                                self.devaddr, self.ram_HS_OnOff, self.max_wait)
+                print("Aborting Process...")
+                try:
+                    valve_status = self.Set_Gas_Valve(False,1)
+                except:
+                    print("Could not close gas valve")
+        
+                if (logs_on == True):
+                    
+                    self.Save_Logs(log_dict,log_headings,times, temp_sps, temp_rmps, temp_ms, temp_ex_ms,\
+                                       speed_sps, speed_1_sps, speed_2_sps, speed_rmps, speed_ms, heat_pows, stirr_stats, err_stats, proc_stats)
+                    
+                break
+        
+        
+            if (event == '-QUIT3-' or event == sg.WIN_CLOSED):
+        
+                if (logs_on == True):
+                    
+                    self.Save_Logs(log_dict,log_headings,times, temp_sps, temp_rmps, temp_ms, temp_ex_ms,\
+                                       speed_sps, speed_1_sps, speed_2_sps, speed_rmps, speed_ms, heat_pows, stirr_stats, err_stats, proc_stats)
+                    
+                    sg.popup("Process will continue with monitor closed")
+    
+                
+                break
+        
+        window_3.close()
+        
+        
+    def Menu_Dialog(self):
+        
+        line0_0 = sg.Text("BIGMAP WP4 RS9000 Control Application",font=('Arial Bold',12))
+        line0_1 = sg.Text("Please Select Function")
+        b0_1 = sg.Button("Process Setup",key='-SETUP-', button_color='navy')
+        b0_2 = sg.Button("Manual Control",key='-MANUAL-', button_color='navy')
+        b0_3 = sg.Button("Quit",key='-QUIT-', button_color='navy')
+        
+        layout_0 = [[line0_0],[line0_1],[b0_1,b0_2],[b0_3]]
+        
+        window_0 = sg.Window("Orbit Shaker Control Application BIGMAP WP4", layout_0, size=(350,150))
+        
+        while True:
+            event, values = window_0.read() # 'window0' was defined in the dialog box setup
+            
+            if (event == '-SETUP-'):
+                comms_open=self.Com_Test_Dialog()
+                if (comms_open==True):
+                    print("Running process setup")
+                    self.Process_Setup_Dialog()
+                else:
+                    print("Could not start comms")
+                    sg.popup("Could not connect with microcontroller")
+                
+            if (event == '-MANUAL-'):
+                comms_open=self.Com_Test_Dialog()
+                if (comms_open==True):
+                    print("Running manual control")
+                    self.Manual_Control_Dialog()
+                else:
+                    print("Could not start comms")
+                    sg.popup("Could not connect with microcontroller")
+            
+            
+            if ((event == '-QUIT-') or (event == sg.WINDOW_CLOSED)):
+                break
+            
+        window_0.close()
+  
+#----------------------Check Microcontroller is Connected-----------------------
+        
+    def Test_Comms(self):
+        try:
+            print('Trying to connect to server...')
+            r1 = requests.get('http://'+self.IP_addr)
+            print('Response of http://'+self.IP_addr+': ')
+            print(r1.status_code)
+        
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+            print ("No server found, timed out. Check microcontroller is switched on and connected.")
+            return False
+        else:
+            print ("Microcontroller is working, ready to receive parameters.")
+            return True
+
+    def Com_Test_Dialog(self):
+        layout=[[sg.Text("Testing comms, please wait.")],[sg.Text("Max. wait approx 30s.")]]
+        wait_win=sg.Window("Comms Test",layout=layout,size=(200,100))
+        
+        while True:
+            event, values=wait_win.read(timeout=500)
+            comms=self.Test_Comms()
+            break
+        wait_win.close()
+        
+        print("Connection Status: "+str(comms))
+        
+        return comms
+    
+#-------------------------Main Loop------------------
+          
+    def Run(self):
+        
+        self.Menu_Dialog()
+
+
+
+    

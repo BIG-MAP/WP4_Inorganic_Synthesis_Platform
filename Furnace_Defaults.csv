@@ -1,0 +1,5 @@
+Segment,Type,Val 1 (TSP),Val 2 (RMP/DWL)
+1,RampRate,550,5
+2,Dwell,550,3
+3,End,,
+4,End,,
