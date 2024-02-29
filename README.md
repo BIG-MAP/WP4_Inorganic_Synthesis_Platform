@@ -14,7 +14,7 @@ The solid NMC622 powder (1 g) is dispensed into a glass vial. The bulk solvent (
 3.	Install python 3 if you don’t already have it available (the platform was developed using winpython, so this may be simplest to use)
 4.	Navigate to the python ‘scripts’ folder (example: C:\Program Files\WPy64-31090\scripts)
 5.	Open the windows command prompt by, for instance, typing ‘cmd’ into the file path in windows explorer
-6.	The scripts require several additional modules on top of those provided by winpython, these are shown below:
+6.	The scripts require several additional modules on top of those provided by winpython, these are:
 a.	PySimpleGUI
 b.	requests
 c.	pyautogui
